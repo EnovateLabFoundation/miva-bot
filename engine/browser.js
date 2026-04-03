@@ -403,17 +403,28 @@ class BrowserEngine {
           
           await this.withRetry(async () => {
             // Use a more robust case-insensitive locator that also scrolls automatically
+            const normalizedAnswer = answer.replace(/\s+/g, ' ').trim();
             const optionLocator = this.page.locator('label').filter({ 
-              hasText: new RegExp(answer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') 
+              hasText: new RegExp(normalizedAnswer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') 
             }).first();
             
-            if (!(await optionLocator.isVisible())) {
-              await this.page.evaluate(() => window.scrollBy(0, 300));
+            try {
+              // Wait for visibility or move to recovery if not found quickly
+              await optionLocator.scrollIntoViewIfNeeded({ timeout: 5000 });
+              await optionLocator.click({ timeout: 5000 });
+            } catch (e) {
+              logger.warn(`Regex match failed for "${answer}". Entering Smart Recovery Mode...`);
+              // SMART RECOVERY: Use LLM to find the index from the actual labels
+              const actualLabels = await this.page.$$eval('label', labels => labels.map(l => l.innerText));
+              const bestIndex = await llm.recoverQuizAction(answer, actualLabels);
+              
+              const recoveredLabel = actualLabels[bestIndex];
+              logger.info(`Smart Recovery: LLM picked Index ${bestIndex} ("${recoveredLabel}")`);
+              const recoveryLocator = this.page.locator('label').nth(bestIndex);
+              await recoveryLocator.scrollIntoViewIfNeeded();
+              await recoveryLocator.click();
             }
-            
-            await optionLocator.scrollIntoViewIfNeeded();
-            await optionLocator.click();
-          });
+          }, 2, 1000); // Shorter retries for recovery
         }
 
         const nextQ = await this.page.locator('input[value="Next page"], button:has-text("Next page")').first();

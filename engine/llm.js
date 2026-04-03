@@ -65,6 +65,22 @@ class LLMEngine {
     const prompt = `Page elements extracted. Identify the best action to continue the course progress.`;
     return await this.generate(prompt, systemPrompt);
   }
+
+  async recoverQuizAction(targetAnswer, options) {
+    const systemPrompt = `You are an LMS quiz recovery expert. 
+    I am trying to click the answer: "${targetAnswer}".
+    However, I cannot find a perfect match in the page labels.
+    
+    Look at these actual on-screen labels (Indexed):
+    ${options.map((opt, i) => `${i}: "${opt}"`).join('\n')}
+    
+    Which index (0-${options.length - 1}) most likely corresponds to the correct answer?
+    Respond with ONLY the index number.`;
+
+    const prompt = `Help me find the correct index for "${targetAnswer}".`;
+    const response = await this.generate(prompt, systemPrompt);
+    return parseInt(response.replace(/[^0-9]/g, '')) || 0;
+  }
 }
 
 module.exports = new LLMEngine();
