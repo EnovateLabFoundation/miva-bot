@@ -43,8 +43,12 @@ class BrowserEngine {
       await locator.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
       
       if (action === 'click') {
-        logger.info(`SafeInteract: Performing native click on ${await locator.count()} element(s)`);
-        await locator.evaluate(el => el.click());
+        logger.info(`SafeInteract: Performing click on element`);
+        await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+        await locator.click({ timeout: 5000 }).catch(async () => {
+             // Fallback to evaluation click for inert/hidden elements
+             await locator.evaluate(el => el.click());
+        });
       } else if (action === 'scroll') {
         await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
       }
@@ -59,7 +63,6 @@ class BrowserEngine {
     this.alertCallback = cb;
   }
 
-  // V4: Chrome Error Detection
   async isErrorState() {
     try {
       if (!this.page || this.page.isClosed()) return true;
@@ -67,7 +70,7 @@ class BrowserEngine {
       const title = await this.page.title().catch(() => '');
       return (url.includes('chrome-error://') || url === 'about:blank' || title.includes('Loading...'));
     } catch (e) {
-      return true; // Assume error if we can't even query the page
+      return true;
     }
   }
 
@@ -118,74 +121,66 @@ class BrowserEngine {
         return await action();
       } catch (error) {
         if (i === retries - 1) throw error;
-        logger.warn(`Action failed (Attempt ${i + 1}/${retries}): ${error.message}. Retrying in ${delay}ms...`);
+        logger.warn(`Action failed (Attempt ${i + 1}/${retries}): ${error.message}. Retrying...`);
         await this.page.waitForTimeout(delay);
-        // delay *= 2; // Exponential backoff (temporarily disabled for quiz recovery)
       }
     }
   }
 
   async searchForNavigation() {
-    // Human Instinct Logic: Prioritize Container -> Sidebar -> Footer
+    // Zone 0: Footer Navigation (Highest reliability)
+    const footerNext = this.page.locator('#next-activity-link, .next-activity-link, a:has-text("Next Activity"), .mod_quiz-next-nav').first();
+    const navbarNext = this.page.locator('#courseNext a, .activity-navigation a:has-text("Next"), .activity-navigation a:has-text("Next section")').first();
+    const containerNext = this.page.locator('.course-content a:has(strong, b), .course-content a:has-text("Next Page"), .course-content button:has-text("Continue")').first();
+    const zones = [footerNext, navbarNext, containerNext];
     
-    // Zone 0: Remui Theme Navbar (High Priority)
-    const navbarNext = this.page.locator('#courseNext a, .activity-navigation a:has-text("Next")').first();
-    
-    // Zone 1: Content Container (Bold Links / Next Page / Continue / Finish)
-    const containerNext = this.page.locator('.course-content a:has(strong, b), .course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:has-text("Next page"), .course-content button:has-text("Finish attempt")').first();
-    
-    // Zone 2: Sidebar (Finish attempt or Question jumping)
-    const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt"), .block_quiz_navigation a:has-text("Submit"), .block_navigation a:has-text("Finish")').first();
-
-    // Zone 3: Footer (Next activity / Next Section / Resume)
-    const footerNext = this.page.locator('.section-navigation a:has-text("Next activity"), .section-navigation a:has-text("Next Section"), .nav-links a:has-text("Next"), a:has-text("Resume")').first();
-
-    logger.info('Searching for navigation buttons via Zone-Aware Smart Scroll...');
-    
-    const zones = [navbarNext, containerNext, sidebarFinish, footerNext];
-    
-    for (let i = 0; i < 15; i++) {
-       for (const [index, loc] of zones.entries()) {
-        if (await loc.isVisible().catch(() => false)) {
-          logger.info(`Found navigation button in Zone ${index + 1}`);
-          return loc;
-        }
-      }
-
-      // Check if we hit the bottom before scrolling again
-      const isAtBottom = await this.page.evaluate(() => {
-        if (!document.body) return true;
-        return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 50);
-      });
-      if (isAtBottom) {
-        logger.info('Reached bottom of page. Final scan complete.');
-        break;
-      }
-
-      await this.page.evaluate(() => window.scrollBy(0, 400));
-      await this.page.waitForTimeout(400);
+    for (const loc of zones) {
+        if (await loc.isVisible().catch(() => false)) return loc;
     }
-    
-    // Search for bold links as last resort (indicates current active navigation in Sidebar)
-    const boldLink = this.page.locator('.nav-links a:has(strong, b)').last();
-    if (await boldLink.isVisible()) return boldLink;
-
-    // Scroll back to top if not found
-    await this.page.evaluate(() => window.scrollTo(0, 0));
+    await this.smartScroll();
+    for (const loc of zones) {
+        if (await loc.isVisible().catch(() => false)) return loc;
+    }
     return null;
   }
 
-  async start() {
-    if (this.isRunning) {
-      throw new Error('An automation session is already in progress. Please wait for it to finish or use /stop.');
+  async jumpToNextUncompleted() {
+    logger.info('Master Flow: Executing Forced Curriculum Jump...');
+    const drawer = this.page.locator('.drawertoggle, [aria-label="Course index"], #accordionEx1').first();
+    if (await this.page.locator('#accordionEx1, .courseindex-content').isHidden()) {
+        await this.safeInteract(drawer, 'click');
+        await this.page.waitForTimeout(2000);
     }
     
+    const items = await this.page.locator('.activity-item, .courseindex-item').all();
+    for (const item of items) {
+        const isDone = await item.locator('.complete_icon, .fa-check, .completion-info .badge-success, [aria-label="Done"]').isVisible().catch(() => false);
+        const isTodo = await item.locator('.completion_incomplete, [aria-label="To do"], .fa-circle, .fa-regular.fa-circle').isVisible().catch(() => false);
+        const isActive = await item.evaluate(el => el.closest('.card, .courseindex-item')?.classList.contains('active')).catch(() => false);
+        
+        if (isTodo && !isActive) {
+            const link = item.locator('a').first();
+            if (await link.isVisible()) {
+                const label = await link.innerText().catch(() => 'Next Activity');
+                logger.info(`Jump Engine: Targeting "${label.trim()}" (Status: TO DO).`);
+                await this.safeInteract(link, 'click');
+                await this.page.waitForLoadState('load').catch(() => {});
+                this.stuckCounter = 0;
+                return true;
+            }
+        }
+    }
+    return false;
+  }
+
+  async start() {
+    if (this.isRunning) throw new Error('Automation already in progress.');
     this.isRunning = true;
     try {
       this.browser = await chromium.launch({ headless: this.isHeadless });
       this.context = await this.browser.newContext();
       this.page = await this.context.newPage();
-      logger.info('Browser started');
+      logger.info('Browser initialized');
     } catch (error) {
       this.isRunning = false;
       throw error;
@@ -195,65 +190,44 @@ class BrowserEngine {
   async login() {
     const email = process.env.MIVA_EMAIL;
     const password = process.env.MIVA_PASSWORD;
-
-    if (!email || !password) {
-      throw new Error('Miva credentials (MIVA_EMAIL and MIVA_PASSWORD) are missing in .env file.');
-    }
-
-    logger.info(`Logging in for: ${email}...`);
+    logger.info(`Scholar V6.5 LOGIN START: ${email}`);
     try {
       await this.withRetry(async () => {
-        // Use 'load' instead of 'networkidle' to avoid timeouts on background script noise
-        await this.page.goto('https://sis.miva.university/login', { waitUntil: 'load', timeout: 45000 });
-        
-        // Wait specifically for the elements we NEED
-        const emailInput = await this.page.waitForSelector('input[name="email"]', { state: 'visible', timeout: 15000 }).catch(() => null);
-        if (emailInput) await emailInput.fill(email);
+        await this.page.goto('https://sis.miva.university/login', { waitUntil: 'domcontentloaded', timeout: 90000 });
+        const emailInput = await this.page.waitForSelector('input[name="email"]', { state: 'visible', timeout: 30000 });
+        await emailInput.fill(email);
         await this.page.fill('input[name="password"]', password);
-        
-        const loginBtn = this.page.locator('button:has-text("Login")');
-        await this.safeInteract(loginBtn, 'click');
-        
-        logger.info('Waiting for dashboard navigation...');
-        await this.page.waitForURL('**/dashboard', { timeout: 30000 }).catch(() => {});
+        await this.safeInteract(this.page.locator('button:has-text("Login")'), 'click');
+        await this.page.waitForURL(/.*dashboard.*/, { timeout: 45000 }).catch(() => {});
       });
-      logger.info('Login successful');
+      logger.info('Login sequence finalized.');
     } catch (error) {
-      await this.analyzeFailure('Login failed', error);
-      throw new Error(`Login failed: ${error.message}`);
+      await this.analyzeFailure('Login failure', error);
+      throw error;
     }
   }
 
   async goToLMS() {
-    logger.info('Navigating to LMS...');
+    logger.info('Navigating to LMS courses catalog...');
     await this.page.goto('https://sis.miva.university/courses');
     const goToClassBtn = this.page.locator(':text("Go to Class")').first();
     await goToClassBtn.waitFor({ state: 'visible', timeout: 45000 }).catch(() => {});
-    
     const [newPage] = await Promise.all([
       this.context.waitForEvent('page'),
       this.safeInteract(goToClassBtn, 'click'),
     ]);
-    
     this.page = newPage;
     await this.page.waitForLoadState();
-    logger.info('Switched to LMS Tab');
   }
 
   async handleCourse(courseName) {
-    if (courseName.startsWith('http')) {
-      logger.info(`Navigating directly to course URL: ${courseName}`);
-      await this.page.goto(courseName);
-    } else {
-      logger.info(`Searching for course: ${courseName}`);
+    if (courseName.startsWith('http')) await this.page.goto(courseName);
+    else {
       const courseCard = await this.page.locator(`div:has-text("${courseName}")`).first();
       await this.safeInteract(courseCard, 'scroll');
-      const viewBtn = await courseCard.locator('a:has-text("View Course")').first();
-      await this.safeInteract(viewBtn, 'click');
+      await this.safeInteract(courseCard.locator('a:has-text("View Course")').first(), 'click');
     }
     await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-    
-    // V3: Build the Curriculum Map at start
     await this.mapCurriculum();
     this.currentCourseId = this.page.url();
 
@@ -262,575 +236,382 @@ class BrowserEngine {
       try {
         await this.page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
         const progress = await this.getProgress();
-        if (progress >= 70) {
-          logger.info(`Goal reached: ${progress}% progress.`);
-          if (this.alertCallback) this.alertCallback(`Success! Reached ${progress}% progress for ${courseName}.`);
+        if (progress >= 100) {
+          if (this.alertCallback) this.alertCallback(`Success! Course ${courseName} complete.`);
           finished = true;
           break;
         }
-
         await this.ensureInActivity();
         await this.runActivityCycle();
         await this.checkForStuck();
-        
-        // V3: Check for session maturity (45 minutes)
-        if (Date.now() - this.lastRefreshTime > 45 * 60 * 1000) {
-          await this.refreshSession();
-        }
-        
+        if (Date.now() - this.lastRefreshTime > 45 * 60 * 1000) await this.refreshSession();
         await this.page.waitForTimeout(1000); 
       } catch (error) {
-        if (error.message.includes('context was destroyed') || error.message.includes('navigation')) {
-          logger.warn('Navigation interrupted the cycle. Retrying after stabilization...');
-          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-        } else {
-          throw error;
-        }
+        if (error.message.includes('context was destroyed')) continue;
+        throw error;
       }
     }
+  }
+
+  async mapCurriculum() {
+    logger.info('Scholar V6.1 Curriculum Mapping sequence...');
+    await this.page.waitForTimeout(5000); 
+    let sidebarLinks = await this.page.locator('.courseindex-link, .aalink, .activityname').all();
+    if (sidebarLinks.length === 0) {
+      logger.info('Sidebar hydration gap detected. Handshaking drawer toggle...');
+      const drawerToggle = this.page.locator('.drawertoggle, [data-region="drawer-toggle"]').first();
+      if (await drawerToggle.isVisible()) {
+          await this.safeInteract(drawerToggle, 'click');
+          await this.page.waitForTimeout(3000);
+          sidebarLinks = await this.page.locator('.courseindex-link, .aalink, .activityname').all();
+      }
+    }
+    this.curriculumMap = [];
+    for (const link of sidebarLinks) {
+      const title = await link.innerText().catch(() => '');
+      const url = await link.getAttribute('href').catch(() => '');
+      if (title && url) this.curriculumMap.push({ title: title.trim(), url });
+    }
+    logger.info(`Curriculum Knowledge Graph built: ${this.curriculumMap.length} activities mapped.`);
   }
 
   async getProgress() {
     try {
-      // Zone 0: Focus Mode Header (V5.2)
-      const fmProgress = await this.page.locator('.fm-navbar .progress-text').first();
-      if (await fmProgress.isVisible()) {
-          const text = await fmProgress.innerText();
-          const progressValue = parseInt(text.replace('%', ''));
-          if (!isNaN(progressValue)) return progressValue;
+      const fmProgressBar = this.page.locator('.fm-navbar .progress-bar, .course-progress-value').first();
+      if (await fmProgressBar.isVisible()) {
+          const ariaValue = await fmProgressBar.getAttribute('aria-valuenow').catch(() => null);
+          if (ariaValue) return parseInt(ariaValue);
       }
-      
-      // Look for progress bar in course landing page or other headers
-      const progressElement = await this.page.locator('.progress-bar-text, .course-progress-value, .progress-text').first(); 
-      if (!(await progressElement.isVisible())) return 0;
-      const text = await progressElement.innerText();
-      return parseInt(text.replace('%', '')) || 0;
+      const fmProgressText = this.page.locator('.progress-text, .progress-bar-text').first();
+      if (await fmProgressText.isVisible()) {
+          const text = await fmProgressText.innerText();
+          const match = text.match(/(\d+)%/);
+          if (match) return parseInt(match[1]);
+      }
     } catch (e) {
-      return 0; 
+      logger.warn(`Progress error: ${e.message}`);
     }
+    return 0;
+  }
+
+  async hasUncompletedTasksInDrawer() {
+    try {
+      const drawer = this.page.locator('#accordionEx1, .courseindex-content');
+      if (await drawer.isVisible({ timeout: 5000 }).catch(() => false)) {
+        const items = await drawer.locator('.activity-item, .courseindex-item').all();
+        let uncompletedCount = 0;
+        for (const item of items) {
+          const isDone = await item.locator('.complete_icon, .fa-check, .completion-info .badge-success').isVisible().catch(() => false);
+          if (!isDone) uncompletedCount++;
+        }
+        return uncompletedCount > 0;
+      }
+    } catch (e) {}
+    return false;
   }
 
   async ensureInActivity() {
-    try {
-      const url = this.page.url();
-      
-      // V5.2: Universal Drawer Intelligence (Higher priority than URL states)
-      const drawer = this.page.locator('#accordionEx1');
-      if (await drawer.isVisible()) {
-          const activities = await drawer.locator('.activity-item').all();
-          let activeIndex = -1;
-          
-          // First, find where we currently are
-          for (let k = 0; k < activities.length; k++) {
-              const isActive = await activities[k].evaluate(el => el.closest('.card').classList.contains('active')).catch(() => false);
-              if (isActive) {
-                  activeIndex = k;
-                  break;
-              }
-          }
-          
-          // If we are at a finish line or in a loop, find the NEXT uncompleted task in the drawer
-          // (Only if we aren't in a quiz session, to avoid accidental exits)
-          if (!url.includes('mod/quiz/attempt.php')) {
-              for (const activity of activities) {
-                  const isDone = await activity.locator('.complete_icon, .fa-check').isVisible().catch(() => false);
-                  const isActive = await activity.evaluate(el => el.closest('.card').classList.contains('active')).catch(() => false);
-                  
-                  if (!isDone && !isActive) {
-                      const link = activity.locator('a').first();
-                      if (await link.isVisible()) {
-                          const label = await link.innerText().catch(() => 'Activity');
-                          logger.info(`Navigating via Drawer to: ${label}`);
-                          await this.safeInteract(link, 'click');
-                          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-                          return;
-                      }
-                  }
-              }
-          }
-      }
-
-      if (url.includes('course/view.php')) {
-        logger.info('On course landing page. Checking for Resume priority...');
-        
-        // V3.2: Immediate priority on "Resume" button if available
-        const resumeBtn = await this.page.locator('button:has-text("Resume"), a:has-text("Resume"), button:has-text("Continue"), a:has-text("Continue")').first();
-        if (await resumeBtn.isVisible().catch(() => false)) {
-          logger.info('Found primary Resume/Continue button. Entering activity...');
+    const url = this.page.url();
+    if (url.includes('course/view.php')) {
+      const resumeBtn = this.page.locator('button:has-text("Resume"), a:has-text("Resume"), button:has-text("Continue"), a:has-text("Continue")').first();
+      if (await resumeBtn.isVisible()) {
           await this.safeInteract(resumeBtn, 'click');
-          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-          return;
-        }
-
-        logger.info('Scanning for the first UNCOMPLETED activity (Remui Aware)...');
-        
-        // V5: Use more precise activity-item selector from ground-truth HTML
-        const activities = await this.page.locator('.activity-item, .course-content .activity').all();
-        for (const activity of activities) {
-          // V5: Target specific 'complete_icon' from ground-truth HTML
-          const isDone = await activity.locator('.activity-completion-indicator.complete_icon, .fa-check, .completion-info .badge-success').isVisible().catch(() => false);
-          if (!isDone) {
-            const link = activity.locator('a').first();
-            if (await link.isVisible().catch(() => false)) {
-              const label = await link.innerText().catch(() => 'Activity');
-              logger.info(`Entering next task: ${label}`);
-              await this.safeInteract(link, 'click');
-              await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-              return;
-            }
-          }
-        }
-
-        logger.warn('Could not find first uncompleted activity. Waiting for manual jump.');
+          await this.page.waitForLoadState('load').catch(() => {});
       }
-    } catch (e) {
-      logger.error(`Error in ensureInActivity: ${e.message}`);
     }
   }
 
   async checkForStuck() {
     const currentUrl = this.page.url();
-    if (currentUrl === this.lastUrl) {
-      this.stuckCounter++;
-    } else {
-      this.stuckCounter = 0;
-    }
+    if (currentUrl === this.lastUrl) this.stuckCounter++;
+    else this.stuckCounter = 0;
     this.lastUrl = currentUrl;
 
     if (this.stuckCounter > 5) {
-      logger.warn('Detected HARD STUCK state. Clearing browser context entirely for Hard Recovery...');
+      logger.warn('HARD STUCK state detected. Clearing session.');
       this.stuckCounter = 0;
       await this.refreshSession();
       return;
     }
-    
     if (this.stuckCounter > 3) {
-      logger.warn('Detected STUCK state. Re-basing to course landing page...');
+      logger.warn('STUCK state. Re-basing to landing page.');
       this.stuckCounter = 0;
-      // Try to find the course root via breadcrumbs or re-navigate to the last known URL
-      const breadcrumb = this.page.locator('.breadcrumb-item a').first();
-      if (await breadcrumb.isVisible().catch(() => false)) {
-        await this.safeInteract(breadcrumb);
-      } else {
-        await this.page.goto(this.currentCourseId || this.lastUrl).catch(() => {});
-      }
+      await this.page.goto(this.currentCourseId || this.lastUrl).catch(() => {});
     }
   }
 
   async runActivityCycle() {
     try {
-      // V4: Immediate Hard-Reset on Error state
-      if (await this.isErrorState()) {
-         logger.warn('Detected Chrome Error Page or Page Crash. Triggering Hard Recovery...');
-         await this.refreshSession();
-         return;
-      }
-
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
-      
       const url = this.page.url();
       const isActivity = url.includes('/mod/') || url.includes('view.php?id=') === false; 
       const pageText = await this.page.innerText('body').catch(() => '');
+      const pageTitle = await this.page.title().catch(() => '');
+      const mainHeading = await this.page.locator('h1, h2, h3').first().innerText().catch(() => '').then(t => t.trim());
 
-      // 1. Mark Done always
-      const markDone = await this.page.locator('button:has-text("Mark Done"), .btn-mark-done').first();
-      if (await markDone.isVisible().catch(() => false)) {
-        await this.safeInteract(markDone, 'click');
-        logger.info('Clicked "Mark Done" (Safe)');
-        await this.page.waitForTimeout(1500);
+      logger.info(`--- MASTER FLOW V6.5 START: ${url} ---`);
+
+      // STATE 1: Mark Done & Skip Completed (Priority Actions)
+      const isDoneStatus = await this.page.locator('[aria-label="Done"], .completion_complete').first().isVisible().catch(() => false);
+      if (isDoneStatus) {
+          logger.info('Master Flow: Activity already DONE. Advancing to next...');
+          const nextBtn = await this.searchForNavigation();
+          if (nextBtn) { await this.safeInteract(nextBtn, 'click'); return; }
       }
 
-      // 2. Alert for Uploads / Downloads
-      if (pageText.includes('upload your file') || pageText.includes('download the template')) {
-        if (this.alertCallback) {
-          await this.alertCallback(`🚨 MANUAL ACTION REQUIRED: The course "${await this.page.title()}" requires a file upload or download. Please visit the link manually to finish this task.`);
+      const markDoneBtn = await this.page.locator('button[data-region="completion-info"], button[aria-label*="Mark as done"], .btn-mark-done').first();
+      if (await markDoneBtn.isVisible().catch(() => false)) {
+        const btnText = await markDoneBtn.innerText().catch(() => '');
+        if (btnText.toLowerCase().includes('mark as done') || btnText.toLowerCase().includes('to do')) {
+          logger.info('Master Flow: Executing "Mark Done" (Priority 1)');
+          await this.safeInteract(markDoneBtn, 'click');
+          await this.page.waitForTimeout(2000);
         }
       }
 
-      // 3. Skip Live Lessons / Office Hours - ONLY if actually in a module
-      const pageTitle = await this.page.title().catch(() => '');
-      const mainHeading = await this.page.locator('h1, h2, h3').first().innerText().catch(() => '');
-      const shouldSkip = (pageTitle.includes('Live Lesson') || pageTitle.includes('Office Hours') || mainHeading.includes('Live Lesson') || mainHeading.includes('Office Hours'));
+      // STATE 2: Alert for Manual Actions
+      if (pageText.includes('upload your file') || pageText.includes('download the template') || pageText.includes('Submit a file')) {
+        if (this.alertCallback) {
+          const detailMsg = `🚨 MANUAL ACTION REQUIRED: "${pageTitle}"\nURL: ${url}\nContext: The LMS requires a manual file upload/download. Please finish this to continue the automation flow.`;
+          await this.alertCallback(detailMsg);
+        }
+      }
 
-      if (isActivity && shouldSkip) {
-        logger.info('Skipping Live Lesson / Office Hours material.');
-        const nextBtn = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity")').first();
-        if (await nextBtn.isVisible().catch(() => false)) {
-          logger.info(`Skipping material: clicking "${await nextBtn.innerText().catch(() => 'Next')}"`);
-          await this.safeInteract(nextBtn, 'click');
+      // STATE 3: Skip Logic
+      const skipKeywords = ['Live Lesson', 'Office Hours', 'Course Material', 'Introduction Video'];
+      if (isActivity && skipKeywords.some(k => pageTitle.includes(k) || mainHeading.includes(k))) {
+        logger.info(`Master Flow: Skipping non-graded material: "${pageTitle}"`);
+        const nextActivity = await this.page.locator('a#next-activity-link, .next-activity-link, a:has-text("Next Activity")').first();
+        if (await nextActivity.isVisible().catch(() => false)) {
+          await this.safeInteract(nextActivity, 'click');
           return;
         }
       }
 
-      // 3.5. Ensure we're at the bottom before searching for next
-      await this.smartScroll();
-
-      // 4. Content Handling
-      const isVideoVisible = await this.page.locator('video').first().isVisible().catch(() => false);
-      const isPDFVisible = await this.page.locator('iframe[src*="pdf"], embed[type="application/pdf"]').first().isVisible().catch(() => false);
-      const isQuiz = (await this.page.locator('.que').count().catch(() => 0)) > 0 || (await this.page.locator('button:has-text("Attempt")').count().catch(() => 0)) > 0;
-
-      if (isVideoVisible) {
+      // STATE 4: Consumption Logic
+      const video = this.page.locator('video, .jw-video, .vjs-tech').first();
+      const pdf = this.page.locator('iframe[src*="pdf"], embed[type="application/pdf"], .pdf-container').first();
+      if (await video.isVisible().catch(() => false)) {
+        logger.info('Master Flow: Consuming Video content (Simulating play/wait)...');
         await this.page.evaluate(() => {
-          const v = document.querySelector('video');
-          if (v && v.duration) v.currentTime = v.duration - 1;
+          const v = document.querySelector('video') || document.querySelector('.jw-video') || document.querySelector('.vjs-tech');
+          if (v && v.duration) {
+              v.play().catch(() => {});
+              v.currentTime = v.duration - 3.5; // Leave 3.5s to play out
+          }
         });
-        logger.info('Video skipped to end. Waiting for LMS sync...');
-        await this.page.waitForTimeout(3000); // 3s buffer for LMS to register completion
-      } else if (isPDFVisible) {
-        await this.page.evaluate(() => {
-          if (document.body) window.scrollTo(0, document.body.scrollHeight);
-        });
-        logger.info('Scrolled through PDF');
-      } else if (isQuiz) {
+        await this.page.waitForTimeout(5000); // Wait for the remaining 3s to play and register
+      } else if (await pdf.isVisible().catch(() => false)) {
+        logger.info('Master Flow: Consuming PDF content...');
+        await this.smartScroll();
+        await this.page.waitForTimeout(2000);
+      }
+
+      // STATE 5: Assessment Entry Handlers
+      const quizKeywords = ['Attempt', 'Answer the questions', 'Re-attempt', 'Continue your'];
+      const quizBtnSelector = quizKeywords.map(k => `button:has-text("${k}"), a:has-text("${k}"), input[value*="${k}"]`).join(', ');
+      const quizActionBtn = this.page.locator(quizBtnSelector).first();
+
+      const isSummaryOrReview = url.includes('summary.php') || url.includes('review.php');
+
+      if (!isSummaryOrReview && await quizActionBtn.isVisible().catch(() => false)) {
+        logger.info(`Master Flow: Entering Assessment: "${await quizActionBtn.innerText().catch(() => 'Quiz')}"`);
+        await this.safeInteract(quizActionBtn, 'click');
+        await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+        return; 
+      }
+
+      if ((await this.page.locator('.que').count().catch(() => 0)) > 0 || isSummaryOrReview) {
         await this.handleQuiz();
       }
 
-      // 4.5. Discussion Forum Handling
-      if (url.includes('/mod/forum/') || pageText.includes('Add a new discussion topic')) {
-        await this.handleDiscussionForum();
-      }
+      // STATE 6: Evaluation & Forum
+      if (pageText.includes('End of course evaluation') || pageTitle.includes('Evaluation')) await this.handleEvaluation();
+      if (url.includes('/mod/forum/') || pageText.includes('Add a new discussion topic')) await this.handleDiscussionForum();
 
-      // 5. Evaluation Handling
-      if (pageText.includes('End of course evaluation')) {
-        await this.handleEvaluation();
-      }
-
-      // 6. Next Activity / Section - Handle both standard buttons and text-based bold links with Smart Search
+      // STATE 7: Final Navigation
       const nextBtn = await this.searchForNavigation();
+      
+      // V6.6: Loop Breaking Force (Notice repetitive hits)
+      if (this.stuckCounter >= 3) {
+          logger.warn(`Master Flow: Loop detected on ${url}. Activating Jump Engine...`);
+          const jumped = await this.jumpToNextUncompleted();
+          if (jumped) return;
+      }
+
       if (nextBtn) {
-        logger.info(`Cycle end: Navigating via found button: "${await nextBtn.innerText().catch(() => 'Next Activity')}"`);
+        logger.info('Master Flow Outcome: Moving to next activity.');
         await this.safeInteract(nextBtn, 'click');
         await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
       } else {
-        // Fallback for Moodle: Find the text-based link with bold characters which is usually the only visible navigation link on the right.
-        const rightNav = await this.page.locator('.activity-navigation a.pull-right, .nav-links a:has(strong, b)').first();
-        if (await rightNav.isVisible()) {
-          logger.info(`Found potential navigation link: "${await rightNav.innerText()}"`);
-          await rightNav.scrollIntoViewIfNeeded();
-          await this.safeInteract(rightNav, 'click');
-          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-        } else {
-          logger.info('Standard navigation not found. Consulting LLM for the "Smart" next step...');
-          const map = await this.getInteractiveMap();
-          
-          // V3: Inject Reflection Memory into decision
-          const experiences = this.getExperiences(this.page.url());
-          const decision = await llm.makeDecision({
-            url: this.page.url(),
-            pageTitle: await this.page.title(),
-            interactiveElements: map
-          }, experiences);
-          
-          if (decision) {
-            logger.info(`LLM Decision: ${decision}`);
-            await this.executeDecision(decision, map);
-          } else {
-            logger.warn('LLM failed to provide a navigation decision.');
-          }
-        }
+        logger.info('Standard navigation not found. Consulting LLM for the "Smart" next step...');
+        const map = await this.getInteractiveMap();
+        const decision = await llm.makeDecision({
+          url: this.page.url(),
+          pageTitle: await this.page.title(),
+          interactiveElements: map
+        }, this.getExperiences(this.page.url()));
+        if (decision) await this.executeDecision(decision, map);
       }
     } catch (error) {
-      if (error.message.includes('context was destroyed') || error.message.includes('navigation')) {
-        // Silently catch and let the main loop retry
-        return;
-      }
-      // V3: Save the failure to Reflection Memory
-      this.saveExperience(this.page.url(), {
-          selector: 'Navigation Search',
-          action: 'SEARCH_AND_CLICK',
-          result: 'Error',
-          message: error.message
-      });
-      throw error;
+      if (!error.message.includes('context was destroyed')) throw error;
     }
   }
 
   async handleQuiz() {
     try {
-      logger.info('Starting Assessment attempt/RE-attempt...');
-      const attemptBtn = await this.page.locator('button:has-text("Answer the Questions"), button:has-text("Attempt"), button:has-text("Attempt Quiz"), button:has-text("Continue your attempt"), button:has-text("Re-attempt quiz")').first();
-      if (await attemptBtn.isVisible()) {
-        await this.safeInteract(attemptBtn, 'click');
-        await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+      logger.info('V6.5 Assessment Logic Active...');
+      // Start/Submit Handlers
+      const startConfirm = this.page.locator('button:has-text("Start attempt"), input[value="Start attempt"]').first();
+      if (await startConfirm.isVisible({ timeout: 3000 }).catch(() => false)) {
+          await this.safeInteract(startConfirm, 'click');
+          await this.page.waitForLoadState('load').catch(() => {});
       }
 
       let assessmentFinished = false;
       while (!assessmentFinished) {
-        // Wait for question to be present
-        const qLocator = this.page.locator('.que').first();
-        const isSummary = await this.page.locator('h2:has-text("Summary of attempt"), .summarytable').first().isVisible();
-        
-        if (!(await qLocator.isVisible()) || isSummary) {
-          if (isSummary) logger.info('At Quiz Summary page. Looking for final submission...');
-          
-          // STEP 1: Click "Submit all and finish" on Summary Page
-          const finalSubmit = this.page.locator('button:has-text("Submit all and finish"), input[value="Submit all and finish"]').first();
-          if (await finalSubmit.isVisible().catch(() => false)) {
-            logger.info('Performing Final Submission (Step 1)...');
-            await this.safeInteract(finalSubmit, 'click');
-            
-            // STEP 2: Handle the confirmation modal (Big Red Button again)
-            logger.info('Waiting for confirmation modal...');
-            const confirmBtn = this.page.locator('.moodle-dialogue-bd button:has-text("Submit all and finish"), .modal-content button:has-text("Submit all and finish")').first();
-            await confirmBtn.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
-            if (await confirmBtn.isVisible().catch(() => false)) {
-                await this.safeInteract(confirmBtn, 'click');
-                logger.info('Assessment confirmed and submitted.');
+        const isSummary = await this.page.locator('body#page-mod-quiz-summary, h2:has-text("Summary of attempt"), .summarytable').first().isVisible();
+        const isReview = this.page.url().includes('review.php');
+
+        if (isSummary) {
+            logger.info('Summary page detected. Triggering final submission...');
+            const finishBtn = this.page.locator('button:has-text("Submit all and finish"), input[value="Submit all and finish"]').first();
+            if (await finishBtn.isVisible()) {
+                await this.safeInteract(finishBtn, 'click');
+                const confirmBtn = this.page.locator('.modal-dialog button:has-text("Submit all and finish"), .confirmation-buttons input[value="Submit all and finish"]').first();
+                if (await confirmBtn.isVisible({ timeout: 5000 }).catch(() => false)) {
+                    await this.safeInteract(confirmBtn, 'click');
+                    await this.page.waitForLoadState('load', { timeout: 45000 }).catch(() => {});
+                }
             }
-          } else {
-             // Fallback for summary-without-button cases
-             const finish = await this.page.locator('input[value="Finish attempt..."], button:has-text("Finish attempt")').first();
-             if (await finish.isVisible().catch(() => false)) {
-               await this.safeInteract(finish, 'click');
-               const finalConfirm = this.page.locator('button:has-text("Submit all and finish")').first();
-               await this.safeInteract(finalConfirm, 'click');
-             }
-          }
-          assessmentFinished = true;
-          break;
+            assessmentFinished = true;
+            break;
         }
 
-        // Multi-Question Scanning Logic (Sequential)
-        const questionsOnPage = await this.page.locator('.que').all();
-        logger.info(`Detected ${questionsOnPage.length} questions on this page.`);
+        if (isReview) { assessmentFinished = true; break; }
 
-        for (const [index, qLoc] of questionsOnPage.entries()) {
-          // Check if already answered
-          const isAnswered = await qLoc.evaluate(el => el.classList.contains('answered') || !el.classList.contains('notyetanswered')).catch(() => false);
-          if (isAnswered) {
-             logger.info(`Question ${index + 1} already answered. Skipping.`);
-             continue;
-          }
-
-          // Frame the question
-          logger.info(`Framing Question ${index + 1}...`);
-          await qLoc.scrollIntoViewIfNeeded({ timeout: 5000 });
-          
-          const questionText = await qLoc.locator('.qtext').textContent(); 
-          const options = await qLoc.locator('.answer div').evaluateAll(els => els.map(e => e.innerText.trim()));
-
-          const response = await llm.solveQuiz({ question: questionText, options });
-          if (response && response.answers && response.answers[0]) {
-            const answer = response.answers[0].selection;
-            logger.info(`LLM Selected Answer for Q${index + 1}: "${answer}"`);
-            
-            await this.withRetry(async () => {
-              const normalizedAnswer = answer.replace(/\s+/g, ' ').trim();
-              const optionLocator = qLoc.locator('label').filter({ 
-                hasText: new RegExp(normalizedAnswer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') 
-              }).first();
-              
-              try {
-                await this.safeInteract(optionLocator, 'click');
-                logger.info(`Q${index + 1} answered.`);
-              } catch (e) {
-                // Local recovery for this specific question
-                const actualLabels = await qLoc.locator('label').allInnerTexts();
-                const bestIndex = await llm.recoverQuizAction(answer, actualLabels);
-                logger.info(`Smart Recovery for Q${index + 1}: LLM picked Index ${bestIndex}`);
-                const recoveryLocator = qLoc.locator('label').nth(bestIndex);
-                await this.safeInteract(recoveryLocator, 'click');
-              }
-            }, 2, 1000);
-          }
+        const qLocs = await this.page.locator('.que').all();
+        if (qLocs.length === 0) {
+            const endLink = this.page.locator('.submitbtns a:has-text("Finish attempt"), .endtestlink, button:has-text("Finish attempt")').first();
+            if (await endLink.isVisible()) {
+                await this.safeInteract(endLink, 'click');
+                continue;
+            }
+            break;
         }
 
-        // Navigation to next page or finish
-        const nextQ = await this.page.locator('input[value="Next page"], button:has-text("Next page")').first();
-        const finishAttempt = await this.page.locator('button:has-text("Finish attempt"), input[value="Finish attempt"]').first();
+        for (const [idx, qLoc] of qLocs.entries()) {
+            await qLoc.scrollIntoViewIfNeeded({ block: 'center' });
+            const qText = await qLoc.locator('.qtext').innerText();
+            const options = await qLoc.locator('label').allInnerTexts();
+            const answer = await llm.solveQuizQuestion(qText, options);
+            logger.info(`Q${idx+1}: ${answer}`);
 
-        if (await nextQ.isVisible()) {
-          await nextQ.evaluate(el => el.click());
-          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-        } else if (await finishAttempt.isVisible()) {
-          logger.info('Finished all questions on page. Proceeding to Summary...');
-          await finishAttempt.evaluate(el => el.click());
+            const alphabetMatch = answer.match(/^([a-dA-D])\./);
+            let optionLocator = null;
+            if (alphabetMatch) {
+                const charIndex = alphabetMatch[1].toLowerCase().charCodeAt(0) - 97;
+                optionLocator = qLoc.locator(`.r${charIndex} input[type="radio"], .r${charIndex} label`).first();
+            }
+            if (!optionLocator || !(await optionLocator.isVisible().catch(() => false))) {
+                 optionLocator = qLoc.locator('label').filter({ hasText: new RegExp(answer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') }).first();
+            }
+            await this.safeInteract(optionLocator, 'click');
+        }
+
+        const nextP = this.page.locator('input[value="Next page"], button:has-text("Next page"), .mod_quiz-next-nav').first();
+        if (await nextP.isVisible()) {
+            await this.safeInteract(nextP, 'click');
+            await this.page.waitForLoadState('load').catch(() => {});
         } else {
-          assessmentFinished = true;
-          break;
+            const finishLink = this.page.locator('.submitbtns a:has-text("Finish attempt"), button:has-text("Finish attempt")').first();
+            if (await finishLink.isVisible()) {
+                await this.safeInteract(finishLink, 'click');
+                await this.page.waitForLoadState('load').catch(() => {});
+            } else assessmentFinished = true;
         }
-      }
-    } catch (error) {
-      if (error.message.includes('context was destroyed') || error.message.includes('navigation')) {
-        return; 
-      }
-      throw error;
-    }
-  }
-  async handleDiscussionForum() {
-    logger.info('Handling Discussion Forum Activity...');
-    try {
-      const addDiscussion = this.page.locator('button:has-text("Add a new discussion topic"), a:has-text("Add a new discussion topic")').first();
-      const replyLink = this.page.locator('a:has-text("Reply")').first();
-
-      if (await addDiscussion.isVisible().catch(() => false)) {
-          await this.safeInteract(addDiscussion, 'click');
-          await this.page.fill('input[name="subject"]', 'Module Review').catch(() => {});
-          await this.page.fill('textarea[name="message"]', 'Okay').catch(() => {});
-          const postBtn = this.page.locator('button:has-text("Post to forum")').first();
-          await this.safeInteract(postBtn, 'click');
-          logger.info('New forum post "Okay" submitted.');
-      } else if (await replyLink.isVisible().catch(() => false)) {
-          await this.safeInteract(replyLink, 'click');
-          await this.page.fill('textarea[name="message"]', 'Okay').catch(() => {});
-          const postBtn = this.page.locator('button:has-text("Post to forum")').first();
-          await this.safeInteract(postBtn, 'click');
-          logger.info('Forum reply "Okay" submitted.');
       }
     } catch (e) {
-      logger.warn(`Failed to handle Discussion Forum: ${e.message}`);
+      logger.warn(`Assessment error: ${e.message}`);
     }
   }
 
   async handleEvaluation() {
-    logger.info('Handling End of Course Evaluation...');
-    // Generic logic to click first option on every radio group (usually 'Very Satisfied')
-    const radioGroups = await this.page.$$('.form-group');
-    for (const group of radioGroups) {
-      const radio = await group.$('input[type="radio"]');
-      if (radio) {
-        const radioLoc = this.page.locator('input[type="radio"]').filter({ has: this.page.locator(radio) }).first();
-        await this.safeInteract(radioLoc, 'click');
-      }
+    logger.info('Handling Course Evaluation...');
+    const ansBtn = this.page.locator('a:has-text("Answer the questions")').first();
+    if (await ansBtn.isVisible()) {
+        await this.safeInteract(ansBtn, 'click');
+        await this.page.waitForTimeout(3000);
+        const radioOptions = await this.page.locator('input[type="radio"]').all();
+        for (const radio of radioOptions) {
+            if (await radio.evaluate(el => el.value === '5')) await radio.check().catch(() => {});
+        }
+        await this.safeInteract(this.page.locator('input[type="submit"], button:has-text("Submit")').first(), 'click');
     }
-    const submitLoc = await this.page.locator('button:has-text("Submit")').first();
-    if (await submitLoc.isVisible().catch(() => false)) {
-      await this.safeInteract(submitLoc, 'click');
+  }
+
+  async handleDiscussionForum() {
+    const addSubject = this.page.locator('input[name="subject"]').first();
+    if (await addSubject.isVisible()) {
+        await addSubject.fill('Module Completion Support');
+        await this.page.fill('textarea[name="message"]', 'Successfully completed the module.');
+        await this.safeInteract(this.page.locator('button:has-text("Post to forum")').first(), 'click');
     }
   }
 
   async executeDecision(decision, map) {
-    try {
-      const decisionLower = decision.toLowerCase();
-      // V5.1: Case-insensitive and phrase-flexible Action/Index matching
-      if (decisionLower.includes('click_next') || decisionLower.includes('click')) {
-        const match = decision.match(/(index|index of) (\d+)/i);
-        if (match) {
-          const index = parseInt(match[2]);
-          const element = map.find(e => e.index === index);
-          if (element) {
-            const oldUrl = this.page.url();
-            logger.info(`Executing LLM Click on: "${element.text}" (Index ${index})`);
-            const preciseLocator = this.page.locator(`${element.tag.toLowerCase()}:has-text("${element.text}")`).first();
-            await this.safeInteract(preciseLocator, 'click');
-            await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-            
-            // Check if we actually moved
-            if (this.page.url() === oldUrl) {
-                logger.warn(`Click on Index ${index} was inert. Saving to memory.`);
-                this.saveExperience(oldUrl, {
-                    index,
-                    text: element.text,
-                    result: 'Inert',
-                    lesson: 'This button does not trigger navigation. Use an alternative.'
-                });
-            }
-          }
+    const match = decision.match(/CLICK_INDEX\((\d+)\)/);
+    if (match) {
+        const index = parseInt(match[1]);
+        const element = map[index];
+        if (element) {
+            logger.info(`Executing Decision: Click index ${index} (${element.text})`);
+            await this.page.mouse.click(element.x + element.width/2, element.y + element.height/2);
+            await this.page.waitForLoadState('load').catch(() => {});
         }
-      } else if (decisionLower.includes('scroll_down')) {
-        await this.smartScroll();
-      } else if (decisionLower.includes('mark_done')) {
-        const markDone = await this.page.locator('button:has-text("Mark Done"), .btn-mark-done').first();
-        if (await markDone.isVisible()) {
-          await markDone.scrollIntoViewIfNeeded();
-          await this.safeInteract(markDone, 'click');
-        }
-      }
-    } catch (e) {
-      logger.error(`Failed to execute LLM decision: ${e.message}`);
     }
   }
 
-  async analyzeFailure(context, error) {
-    const url = this.page ? this.page.url() : 'N/A';
-    logger.error(`[FAILURE ANALYZER] Context: ${context}. URL: ${url}. Error: ${error.message}`);
-    
-    try {
-      // Small logic to use LLM to identify if this is a common issue
-      const screenshot = await this.page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
-      if (screenshot) {
-        logger.info('Captured screenshot of failure for later review.');
-      }
-      
-      const map = await this.getInteractiveMap().catch(() => []);
-      const analysis = await llm.makeDecision({
-        type: 'ERROR_ANALYSIS',
-        context,
-        errorMessage: error.message,
-        url,
-        interactiveElements: map
-      });
-      
-      if (analysis) {
-        logger.info(`LLM Failure Analysis: ${analysis}`);
-        // If the LLM suggests a simple fix (like "CLICK_SOMETHING_ELSE"), we could attempt it here
-      }
-    } catch (e) {
-      logger.warn(`Failure Analyzer itself failed: ${e.message}`);
-    }
+  async analyzeFailure(msg, error) {
+    logger.error(`${msg}: ${error.message}`);
+    await this.saveDebugState(msg.replace(/\s+/g, '_').toUpperCase());
   }
 
-  async mapCurriculum() {
-    logger.info('Building Knowledge Graph of the entire course...');
-    try {
-      const activities = await this.page.locator('.course-content .activity a').all();
-      this.curriculumMap = [];
-      for (const link of activities) {
-        const title = await link.innerText().catch(() => 'Activity');
-        const href = await link.getAttribute('href').catch(() => null);
-        if (href) {
-          this.curriculumMap.push({ title, url: href });
-        }
-      }
-      logger.info(`Graph complete: Found ${this.curriculumMap.length} total activities.`);
-    } catch (e) {
-      logger.warn(`Failed to build Curriculum Graph: ${e.message}`);
-    }
-  }
-
-  async humanWait(type = 'default') {
-    const jitter = Math.random() * 5000 + 3000; // 3-8s random wait
-    const baseWait = type === 'video' ? 15000 : (type === 'pdf' ? 10000 : 5000);
-    const total = baseWait + jitter;
-    logger.info(`Simulating human ${type} consumption... waiting ${Math.round(total/1000)}s`);
-    await this.page.waitForTimeout(total);
+  async saveDebugState(tag) {
+    if (!this.page) return;
+    const dir = 'screenshots/debug';
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const ts = Date.now();
+    await this.page.screenshot({ path: `${dir}/${tag}_${ts}.png` });
+    fs.writeFileSync(`${dir}/${tag}_${ts}.html`, await this.page.content());
   }
 
   async refreshSession() {
-      logger.info('Time for a technical deep-clean. Refreshing browser context...');
-      this.lastRefreshTime = Date.now();
-      await this.browser.close();
+    logger.info('Refreshing session context...');
+    try {
+      await this.stop();
       await this.start();
       await this.login();
-      if (this.currentCourseId) await this.page.goto(this.currentCourseId);
+      await this.goToLMS();
+      this.lastRefreshTime = Date.now();
+    } catch (e) {
+      logger.error(`Critical Re-login failed: ${e.message}`);
+    }
   }
 
   getExperiences(url) {
+    if (!fs.existsSync(MEMORY_FILE)) return [];
     try {
-      if (fs.existsSync(MEMORY_FILE)) {
-        const data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf-8'));
-        return data[url] || [];
-      }
-    } catch (e) {
-      logger.warn(`Failed to read reflection memory: ${e.message}`);
-    }
-    return [];
+        const data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
+        return data.filter(e => e.url === url);
+    } catch (e) { return []; }
   }
 
   saveExperience(url, experience) {
-    try {
-      let data = {};
-      if (fs.existsSync(MEMORY_FILE)) {
-        data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf-8'));
-      }
-      if (!data[url]) data[url] = [];
-      data[url].push({ ...experience, timestamp: new Date().toISOString() });
-      fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2));
-      logger.info(`Reflection Memory updated for URL: ${url}`);
-    } catch (e) {
-      logger.warn(`Failed to save reflection memory: ${e.message}`);
-    }
+    if (!fs.existsSync(path.dirname(MEMORY_FILE))) fs.mkdirSync(path.dirname(MEMORY_FILE), { recursive: true });
+    let data = [];
+    if (fs.existsSync(MEMORY_FILE)) data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf8'));
+    data.push({ url, timestamp: new Date().toISOString(), ...experience });
+    fs.writeFileSync(MEMORY_FILE, JSON.stringify(data.slice(-50), null, 2));
   }
 
   async stop() {
@@ -838,6 +619,7 @@ class BrowserEngine {
     if (this.browser) {
       await this.browser.close();
       this.browser = null;
+      logger.info('Browser stopped');
     }
   }
 }

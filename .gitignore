@@ -2,3 +2,6 @@
 node_modules
 logs/
 .pm2/
+
+screenshots/
+memory/
