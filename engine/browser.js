@@ -399,119 +399,111 @@ class BrowserEngine {
 
   async handleQuiz() {
     try {
-      logger.info('Starting Assessment attempt...');
+      logger.info('Starting Assessment attempt/RE-attempt...');
       const attemptBtn = await this.page.locator('button:has-text("Answer the Questions"), button:has-text("Attempt"), button:has-text("Attempt Quiz"), button:has-text("Continue your attempt"), button:has-text("Re-attempt quiz")').first();
-      await attemptBtn.scrollIntoViewIfNeeded();
-      await attemptBtn.click();
-      await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+      if (await attemptBtn.isVisible()) {
+        await attemptBtn.click();
+        await this.page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
+      }
 
-      let hasQuestions = true;
-      while (hasQuestions) {
+      let assessmentFinished = false;
+      while (!assessmentFinished) {
         // Wait for question to be present
-        const qLocator = this.page.locator('.qtext').first();
+        const qLocator = this.page.locator('.que').first();
         const isSummary = await this.page.locator('h2:has-text("Summary of attempt"), .summarytable').first().isVisible();
         
         if (!(await qLocator.isVisible()) || isSummary) {
           if (isSummary) logger.info('At Quiz Summary page. Looking for final submission...');
           
-          // Zone 2 Check: Sidebar Finish (Learned from Loom Video)
-          const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt")').first();
-          
-          // Zone 1 Check: Big Red Button (Final Submission)
+          // STEP 1: Click "Submit all and finish" on Summary Page
           const finalSubmit = this.page.locator('button:has-text("Submit all and finish"), input[value="Submit all and finish"]').first();
-          
           if (await finalSubmit.isVisible()) {
-            logger.info('Performing Final Submission via Big Red Button...');
+            logger.info('Performing Final Submission (Step 1)...');
             await finalSubmit.evaluate(el => el.click());
-            // Handled the confirmation modal if it appears
-            await this.page.locator('.moodle-dialogue-bd button:has-text("Submit all and finish")').first().click().catch(() => {});
-          } else if (await sidebarFinish.isVisible()) {
-            logger.info('Finishing attempt via Sidebar link...');
-            await sidebarFinish.evaluate(el => el.click());
-            await this.page.locator('button:has-text("Submit all and finish")').first().click().catch(() => {});
-          } else {
-            // Check if we finished or need to submit via main area
-            const finish = await this.page.locator('input[value="Finish attempt..."], button:has-text("Finish attempt")').first();
-            if (await finish.isVisible()) {
-              await finish.evaluate(el => el.click());
-              await this.page.locator('button:has-text("Submit all and finish")').first().click().catch(() => {});
+            
+            // STEP 2: Handle the confirmation modal (Big Red Button again)
+            logger.info('Waiting for confirmation modal...');
+            const confirmBtn = this.page.locator('.moodle-dialogue-bd button:has-text("Submit all and finish"), .modal-content button:has-text("Submit all and finish")').first();
+            await confirmBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
+            if (await confirmBtn.isVisible()) {
+                await confirmBtn.click();
+                logger.info('Assessment confirmed and submitted.');
             }
+          } else {
+             // Fallback for summary-without-button cases
+             const finish = await this.page.locator('input[value="Finish attempt..."], button:has-text("Finish attempt")').first();
+             if (await finish.isVisible()) {
+               await finish.evaluate(el => el.click());
+               await this.page.locator('button:has-text("Submit all and finish")').first().click().catch(() => {});
+             }
           }
-          hasQuestions = false;
+          assessmentFinished = true;
           break;
         }
 
-        const questionText = await qLocator.textContent(); 
-        const options = await this.page.$$eval('.answer div', els => els.map(e => e.innerText));
+        // Multi-Question Scanning Logic (Sequential)
+        const questionsOnPage = await this.page.locator('.que').all();
+        logger.info(`Detected ${questionsOnPage.length} questions on this page.`);
 
-        // State Check: If the question is already answered (manually or by previous run), skip.
-        const isAnswered = await this.page.locator('.que.answered, .que.notyetanswered').first().evaluate(el => !el.classList.contains('notyetanswered')).catch(() => false);
-        
-        if (isAnswered) {
-          logger.info('Question already answered. Moving to next.');
-        } else {
+        for (const [index, qLoc] of questionsOnPage.entries()) {
+          // Check if already answered
+          const isAnswered = await qLoc.evaluate(el => el.classList.contains('answered') || !el.classList.contains('notyetanswered')).catch(() => false);
+          if (isAnswered) {
+             logger.info(`Question ${index + 1} already answered. Skipping.`);
+             continue;
+          }
+
+          // Frame the question
+          logger.info(`Framing Question ${index + 1}...`);
+          await qLoc.scrollIntoViewIfNeeded({ timeout: 5000 });
+          
+          const questionText = await qLoc.locator('.qtext').textContent(); 
+          const options = await qLoc.locator('.answer div').evaluateAll(els => els.map(e => e.innerText.trim()));
+
           const response = await llm.solveQuiz({ question: questionText, options });
           if (response && response.answers && response.answers[0]) {
             const answer = response.answers[0].selection;
-            
-            logger.info(`LLM Selected Answer: "${answer}"`);
+            logger.info(`LLM Selected Answer for Q${index + 1}: "${answer}"`);
             
             await this.withRetry(async () => {
-              // Use a more robust case-insensitive locator that also scrolls automatically
               const normalizedAnswer = answer.replace(/\s+/g, ' ').trim();
-              const optionLocator = this.page.locator('label').filter({ 
+              const optionLocator = qLoc.locator('label').filter({ 
                 hasText: new RegExp(normalizedAnswer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') 
               }).first();
               
               try {
-                // Increased timeout and added nudge scroll check
                 if (!(await optionLocator.isVisible())) {
-                  logger.info('Option not immediately visible. Nudging container scroll...');
-                  await this.page.evaluate(() => window.scrollBy(0, 300));
+                  await qLoc.scrollIntoViewIfNeeded(); // Extra framing
                 }
-                
-                // Use DOM CLICK to bypass "pointer-interception" errors (fieldsets/divs blocking click)
                 await optionLocator.scrollIntoViewIfNeeded({ timeout: 5000 });
                 await optionLocator.evaluate(el => el.click());
-                logger.info('Answer clicked via Native DOM event.');
+                logger.info(`Q${index + 1} answered.`);
               } catch (e) {
-                logger.warn(`Regex match failed for "${answer}" or scroll timed out. Entering Smart Recovery Mode...`);
-                // SMART RECOVERY: Use LLM to find the index from the actual labels
-                const actualLabels = await this.page.$$eval('label', labels => labels.map(l => l.innerText));
+                // Local recovery for this specific question
+                const actualLabels = await qLoc.locator('label').allInnerTexts();
                 const bestIndex = await llm.recoverQuizAction(answer, actualLabels);
-                
-                const recoveredLabel = actualLabels[bestIndex];
-                logger.info(`Smart Recovery: LLM picked Index ${bestIndex} ("${recoveredLabel}")`);
-                const recoveryLocator = this.page.locator('label').nth(bestIndex);
-                
+                logger.info(`Smart Recovery for Q${index + 1}: LLM picked Index ${bestIndex}`);
+                const recoveryLocator = qLoc.locator('label').nth(bestIndex);
                 await recoveryLocator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
                 await recoveryLocator.evaluate(el => el.click());
               }
-            }, 2, 1000); // Shorter retries for recovery
+            }, 2, 1000);
           }
         }
 
+        // Navigation to next page or finish
         const nextQ = await this.page.locator('input[value="Next page"], button:has-text("Next page")').first();
         const finishAttempt = await this.page.locator('button:has-text("Finish attempt"), input[value="Finish attempt"]').first();
 
         if (await nextQ.isVisible()) {
-          await nextQ.scrollIntoViewIfNeeded();
-          await nextQ.evaluate(el => el.click()); // Using native click for stability
-          await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+          await nextQ.evaluate(el => el.click());
+          await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
         } else if (await finishAttempt.isVisible()) {
-          logger.info('No "Next page" found, but "Finish attempt" is visible. Finalizing Quiz...');
+          logger.info('Finished all questions on page. Proceeding to Summary...');
           await finishAttempt.evaluate(el => el.click());
-          
-          // Look for final submission button (Big Red Button)
-          const finalSubmit = this.page.locator('button:has-text("Submit all and finish"), input[value="Submit all and finish"]').first();
-          if (await finalSubmit.isVisible({ timeout: 5000 })) {
-             await finalSubmit.evaluate(el => el.click());
-             await this.page.locator('.moodle-dialogue-bd button:has-text("Submit all and finish")').first().click().catch(() => {});
-          }
-          hasQuestions = false;
-          break;
         } else {
-          hasQuestions = false;
+          assessmentFinished = true;
+          break;
         }
       }
     } catch (error) {
