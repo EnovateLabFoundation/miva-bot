@@ -1,7 +1,11 @@
 const { chromium } = require('playwright');
 const winston = require('winston');
 const llm = require('./llm');
+const fs = require('fs');
+const path = require('path');
 require('dotenv').config();
+
+const MEMORY_FILE = path.join(__dirname, '..', 'memory', 'experiences.json');
 
 const logger = winston.createLogger({
   level: 'info',
@@ -26,6 +30,9 @@ class BrowserEngine {
     this.lastUrl = '';
     this.isRunning = false;
     this.lastProgressTime = Date.now();
+    this.curriculumMap = [];
+    this.lastRefreshTime = Date.now();
+    this.currentCourseId = null;
   }
 
   async safeInteract(locator, action = 'click') {
@@ -229,7 +236,11 @@ class BrowserEngine {
       const viewBtn = await courseCard.locator('a:has-text("View Course")').first();
       await this.safeInteract(viewBtn, 'click');
     }
-    await this.page.waitForLoadState();
+    await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+    
+    // V3: Build the Curriculum Map at start
+    await this.mapCurriculum();
+    this.currentCourseId = this.page.url();
 
     let finished = false;
     while (!finished) {
@@ -246,7 +257,13 @@ class BrowserEngine {
         await this.ensureInActivity();
         await this.runActivityCycle();
         await this.checkForStuck();
-        await this.page.waitForTimeout(1000); // Small cooldown to prevent loop spamming 
+        
+        // V3: Check for session maturity (45 minutes)
+        if (Date.now() - this.lastRefreshTime > 45 * 60 * 1000) {
+          await this.refreshSession();
+        }
+        
+        await this.page.waitForTimeout(1000); 
       } catch (error) {
         if (error.message.includes('context was destroyed') || error.message.includes('navigation')) {
           logger.warn('Navigation interrupted the cycle. Retrying after stabilization...');
@@ -414,11 +431,14 @@ class BrowserEngine {
         } else {
           logger.info('Standard navigation not found. Consulting LLM for the "Smart" next step...');
           const map = await this.getInteractiveMap();
+          
+          // V3: Inject Reflection Memory into decision
+          const experiences = this.getExperiences(this.page.url());
           const decision = await llm.makeDecision({
             url: this.page.url(),
             pageTitle: await this.page.title(),
             interactiveElements: map
-          });
+          }, experiences);
           
           if (decision) {
             logger.info(`LLM Decision: ${decision}`);
@@ -433,6 +453,13 @@ class BrowserEngine {
         // Silently catch and let the main loop retry
         return;
       }
+      // V3: Save the failure to Reflection Memory
+      this.saveExperience(this.page.url(), {
+          selector: 'Navigation Search',
+          action: 'SEARCH_AND_CLICK',
+          result: 'Error',
+          message: error.message
+      });
       throw error;
     }
   }
@@ -646,6 +673,68 @@ class BrowserEngine {
       }
     } catch (e) {
       logger.warn(`Failure Analyzer itself failed: ${e.message}`);
+    }
+  }
+
+  async mapCurriculum() {
+    logger.info('Building Knowledge Graph of the entire course...');
+    try {
+      const activities = await this.page.locator('.course-content .activity a').all();
+      this.curriculumMap = [];
+      for (const link of activities) {
+        const title = await link.innerText().catch(() => 'Activity');
+        const href = await link.getAttribute('href').catch(() => null);
+        if (href) {
+          this.curriculumMap.push({ title, url: href });
+        }
+      }
+      logger.info(`Graph complete: Found ${this.curriculumMap.length} total activities.`);
+    } catch (e) {
+      logger.warn(`Failed to build Curriculum Graph: ${e.message}`);
+    }
+  }
+
+  async humanWait(type = 'default') {
+    const jitter = Math.random() * 5000 + 3000; // 3-8s random wait
+    const baseWait = type === 'video' ? 15000 : (type === 'pdf' ? 10000 : 5000);
+    const total = baseWait + jitter;
+    logger.info(`Simulating human ${type} consumption... waiting ${Math.round(total/1000)}s`);
+    await this.page.waitForTimeout(total);
+  }
+
+  async refreshSession() {
+      logger.info('Time for a technical deep-clean. Refreshing browser context...');
+      this.lastRefreshTime = Date.now();
+      await this.browser.close();
+      await this.start();
+      await this.login();
+      if (this.currentCourseId) await this.page.goto(this.currentCourseId);
+  }
+
+  getExperiences(url) {
+    try {
+      if (fs.existsSync(MEMORY_FILE)) {
+        const data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf-8'));
+        return data[url] || [];
+      }
+    } catch (e) {
+      logger.warn(`Failed to read reflection memory: ${e.message}`);
+    }
+    return [];
+  }
+
+  saveExperience(url, experience) {
+    try {
+      let data = {};
+      if (fs.existsSync(MEMORY_FILE)) {
+        data = JSON.parse(fs.readFileSync(MEMORY_FILE, 'utf-8'));
+      }
+      if (!data[url]) data[url] = [];
+      data[url].push({ ...experience, timestamp: new Date().toISOString() });
+      fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2));
+      logger.info(`Reflection Memory updated for URL: ${url}`);
+    } catch (e) {
+      logger.warn(`Failed to save reflection memory: ${e.message}`);
     }
   }
 

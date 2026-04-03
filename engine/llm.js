@@ -41,10 +41,16 @@ class LLMEngine {
     }
   }
 
-  async makeDecision(currentState) {
+  async makeDecision(currentState, experiences = []) {
+    const memoryContext = experiences.length > 0 
+      ? `PAST EXPERIENCES (Lessons Learned):\n${JSON.stringify(experiences)}`
+      : "No past experiences for this URL.";
+
     const systemPrompt = `You are an autonomous browser agent for Miva Open University LMS. 
     Analyze the current page state and the list of interactive elements.
     Identify the "Next Activity", "Next Section", or the logical next step in the course curriculum.
+    
+    ${memoryContext}
     
     Current URL: ${currentState.url}
     Page Title: ${currentState.pageTitle}
