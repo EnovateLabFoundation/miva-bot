@@ -83,21 +83,36 @@ class BrowserEngine {
   }
 
   async searchForNavigation() {
-    const locators = [
-      this.page.locator('a:has-text("Next Page"), a:has-text("Next page"), a:has-text("Continue"), button:has-text("Continue")'),
-      this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text'),
-      this.page.locator('.activity-navigation a.pull-right, .nav-links a:has(strong, b)')
-    ];
+    // Human Instinct Logic: Prioritize Container -> Sidebar -> Footer
+    
+    // Zone 1: Content Container (Next Page / Continue)
+    const containerNext = this.page.locator('.course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:contains("Next page")').first();
+    
+    // Zone 2: Sidebar (Finish attempt or Question jumping)
+    const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt"), .block_quiz_navigation a:has-text("Submit"), .block_navigation a:has-text("Finish")').first();
 
-    logger.info('Searching for navigation buttons via Smart Scroll...');
+    // Zone 3: Footer (Next activity)
+    const footerNext = this.page.locator('.section-navigation a:has-text("Next activity"), .section-navigation a:has-text("Next Section"), .nav-links a:has-text("Next")').first();
+
+    logger.info('Searching for navigation buttons via Zone-Aware Smart Scroll...');
+    
+    const zones = [containerNext, sidebarFinish, footerNext];
+    
     for (let i = 0; i < 5; i++) {
-      for (const loc of locators) {
-        if (await loc.first().isVisible()) return loc.first();
+       for (const [index, loc] of zones.entries()) {
+        if (await loc.isVisible()) {
+          logger.info(`Found navigation button in Zone ${index + 1}`);
+          return loc;
+        }
       }
       await this.page.evaluate(() => window.scrollBy(0, 800));
       await this.page.waitForTimeout(500);
     }
     
+    // Search for bold links as last resort (indicates current active navigation in Sidebar)
+    const boldLink = this.page.locator('.nav-links a:has(strong, b)').last();
+    if (await boldLink.isVisible()) return boldLink;
+
     // Scroll back to top if not found
     await this.page.evaluate(() => window.scrollTo(0, 0));
     return null;
@@ -394,11 +409,19 @@ class BrowserEngine {
         // Wait for question to be present
         const qLocator = this.page.locator('.qtext').first();
         if (!(await qLocator.isVisible())) {
-          // Check if we finished or need to submit
-          const finish = await this.page.locator('input[value="Finish attempt..."], button:has-text("Finish attempt")').first();
-          if (await finish.isVisible()) {
-            await finish.click();
-            await this.page.locator('button:has-text("Submit all and finish")').first().click();
+          // Zone 2 Check: Sidebar Finish (Learned from Loom Video)
+          const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt")').first();
+          if (await sidebarFinish.isVisible()) {
+            logger.info('Finishing attempt via Sidebar link...');
+            await sidebarFinish.evaluate(el => el.click());
+            await this.page.locator('button:has-text("Submit all and finish")').first().click().catch(() => {});
+          } else {
+            // Check if we finished or need to submit via main area
+            const finish = await this.page.locator('input[value="Finish attempt..."], button:has-text("Finish attempt")').first();
+            if (await finish.isVisible()) {
+              await finish.evaluate(el => el.click());
+              await this.page.locator('button:has-text("Submit all and finish")').first().click().catch(() => {});
+            }
           }
           hasQuestions = false;
           break;
@@ -450,7 +473,7 @@ class BrowserEngine {
         const nextQ = await this.page.locator('input[value="Next page"], button:has-text("Next page")').first();
         if (await nextQ.isVisible()) {
           await nextQ.scrollIntoViewIfNeeded();
-          await nextQ.click();
+          await nextQ.evaluate(el => el.click()); // Using native click for stability
           await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
         } else {
           hasQuestions = false;
