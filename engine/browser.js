@@ -627,10 +627,22 @@ class BrowserEngine {
           const index = parseInt(match[1]);
           const element = map.find(e => e.index === index);
           if (element) {
+            const oldUrl = this.page.url();
             logger.info(`Executing LLM Click on: "${element.text}" (Index ${index})`);
             const preciseLocator = this.page.locator(`${element.tag.toLowerCase()}:has-text("${element.text}")`).first();
             await this.safeInteract(preciseLocator, 'click');
             await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+            
+            // Check if we actually moved
+            if (this.page.url() === oldUrl) {
+                logger.warn(`Click on Index ${index} was inert. Saving to memory.`);
+                this.saveExperience(oldUrl, {
+                    index,
+                    text: element.text,
+                    result: 'Inert',
+                    lesson: 'This button does not trigger navigation. Use an alternative.'
+                });
+            }
           }
         }
       } else if (decision.includes('SCROLL_DOWN')) {
