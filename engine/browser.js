@@ -280,7 +280,7 @@ class BrowserEngine {
       if (await resumeBtn.isVisible()) {
         logger.info('Found Resume/Continue button. Clicking...');
         await resumeBtn.scrollIntoViewIfNeeded();
-        await resumeBtn.click();
+        await this.safeInteract(resumeBtn, 'click');
         await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
         return;
       }
@@ -291,7 +291,7 @@ class BrowserEngine {
       if (await firstActivity.isVisible()) {
         logger.info('Entering first available activity from menu...');
         await firstActivity.scrollIntoViewIfNeeded();
-        await firstActivity.click();
+        await this.safeInteract(firstActivity, 'click');
         await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
         return;
       }
@@ -401,7 +401,7 @@ class BrowserEngine {
         if (await rightNav.isVisible()) {
           logger.info(`Found potential navigation link: "${await rightNav.innerText()}"`);
           await rightNav.scrollIntoViewIfNeeded();
-          await rightNav.click();
+          await this.safeInteract(rightNav, 'click');
           await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
         } else {
           logger.info('Standard navigation not found. Consulting LLM for the "Smart" next step...');
@@ -434,7 +434,7 @@ class BrowserEngine {
       logger.info('Starting Assessment attempt/RE-attempt...');
       const attemptBtn = await this.page.locator('button:has-text("Answer the Questions"), button:has-text("Attempt"), button:has-text("Attempt Quiz"), button:has-text("Continue your attempt"), button:has-text("Re-attempt quiz")').first();
       if (await attemptBtn.isVisible()) {
-        await attemptBtn.click();
+        await this.safeInteract(attemptBtn, 'click');
         await this.page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
       }
 
@@ -548,10 +548,15 @@ class BrowserEngine {
     const radioGroups = await this.page.$$('.form-group');
     for (const group of radioGroups) {
       const radio = await group.$('input[type="radio"]');
-      if (radio) await radio.click();
+      if (radio) {
+        const radioLoc = this.page.locator('input[type="radio"]').filter({ has: this.page.locator(radio) }).first();
+        await this.safeInteract(radioLoc, 'click');
+      }
     }
-    const submit = await this.page.$('button:has-text("Submit")');
-    if (submit) await submit.click();
+    const submitLoc = await this.page.locator('button:has-text("Submit")').first();
+    if (await submitLoc.isVisible().catch(() => false)) {
+      await this.safeInteract(submitLoc, 'click');
+    }
   }
 
   async executeDecision(decision, map) {
@@ -575,7 +580,7 @@ class BrowserEngine {
         const markDone = await this.page.locator('button:has-text("Mark Done"), .btn-mark-done').first();
         if (await markDone.isVisible()) {
           await markDone.scrollIntoViewIfNeeded();
-          await markDone.click();
+        await this.safeInteract(markDone, 'click');
         }
       }
     } catch (e) {
