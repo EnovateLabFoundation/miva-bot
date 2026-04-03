@@ -77,9 +77,30 @@ class BrowserEngine {
         if (i === retries - 1) throw error;
         logger.warn(`Action failed (Attempt ${i + 1}/${retries}): ${error.message}. Retrying in ${delay}ms...`);
         await this.page.waitForTimeout(delay);
-        delay *= 2; // Exponential backoff
+        // delay *= 2; // Exponential backoff (temporarily disabled for quiz recovery)
       }
     }
+  }
+
+  async searchForNavigation() {
+    const locators = [
+      this.page.locator('a:has-text("Next Page"), a:has-text("Next page"), a:has-text("Continue"), button:has-text("Continue")'),
+      this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text'),
+      this.page.locator('.activity-navigation a.pull-right, .nav-links a:has(strong, b)')
+    ];
+
+    logger.info('Searching for navigation buttons via Smart Scroll...');
+    for (let i = 0; i < 5; i++) {
+      for (const loc of locators) {
+        if (await loc.first().isVisible()) return loc.first();
+      }
+      await this.page.evaluate(() => window.scrollBy(0, 800));
+      await this.page.waitForTimeout(500);
+    }
+    
+    // Scroll back to top if not found
+    await this.page.evaluate(() => window.scrollTo(0, 0));
+    return null;
   }
 
   async start() {
@@ -318,22 +339,13 @@ class BrowserEngine {
         await this.handleEvaluation();
       }
 
-      // 6. Next Activity / Section - Handle both standard buttons and text-based bold links
-      // Priority 1: Next Page / Continue within the same lesson
-      const priorityNext = await this.page.locator('a:has-text("Next Page"), a:has-text("Next page"), a:has-text("Continue"), button:has-text("Continue")').first();
-      
-      // Priority 2: Next Activity / Next Section
-      const generalNext = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
-      
-      if (await priorityNext.isVisible()) {
-        logger.info(`Priority Navigation: "${await priorityNext.innerText()}"`);
-        await priorityNext.scrollIntoViewIfNeeded();
-        await priorityNext.click();
-        await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
-      } else if (await generalNext.isVisible()) {
-        logger.info(`General Navigation: "${await generalNext.innerText()}"`);
-        await generalNext.scrollIntoViewIfNeeded();
-        await generalNext.click();
+      // 6. Next Activity / Section - Handle both standard buttons and text-based bold links with Smart Search
+      const nextBtn = await this.searchForNavigation();
+      if (nextBtn) {
+        logger.info(`Cycle end: Navigating via found button: "${await nextBtn.innerText()}"`);
+        await nextBtn.scrollIntoViewIfNeeded();
+        // Use native click to bypass interception
+        await nextBtn.evaluate(el => el.click());
         await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
       } else {
         // Fallback for Moodle: Find the text-based link with bold characters which is usually the only visible navigation link on the right.
@@ -395,36 +407,44 @@ class BrowserEngine {
         const questionText = await qLocator.textContent(); 
         const options = await this.page.$$eval('.answer div', els => els.map(e => e.innerText));
 
-        const response = await llm.solveQuiz({ question: questionText, options });
-        if (response && response.answers && response.answers[0]) {
-          const answer = response.answers[0].selection;
-          
-          logger.info(`LLM Selected Answer: "${answer}"`);
-          
-          await this.withRetry(async () => {
-            // Use a more robust case-insensitive locator that also scrolls automatically
-            const normalizedAnswer = answer.replace(/\s+/g, ' ').trim();
-            const optionLocator = this.page.locator('label').filter({ 
-              hasText: new RegExp(normalizedAnswer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') 
-            }).first();
+        // State Check: If the question is already answered (manually or by previous run), skip.
+        const isAnswered = await this.page.locator('.que.answered, .que.notyetanswered').first().evaluate(el => !el.classList.contains('notyetanswered')).catch(() => false);
+        
+        if (isAnswered) {
+          logger.info('Question already answered. Moving to next.');
+        } else {
+          const response = await llm.solveQuiz({ question: questionText, options });
+          if (response && response.answers && response.answers[0]) {
+            const answer = response.answers[0].selection;
             
-            try {
-              // Wait for visibility or move to recovery if not found quickly
-              await optionLocator.scrollIntoViewIfNeeded({ timeout: 5000 });
-              await optionLocator.click({ timeout: 5000 });
-            } catch (e) {
-              logger.warn(`Regex match failed for "${answer}". Entering Smart Recovery Mode...`);
-              // SMART RECOVERY: Use LLM to find the index from the actual labels
-              const actualLabels = await this.page.$$eval('label', labels => labels.map(l => l.innerText));
-              const bestIndex = await llm.recoverQuizAction(answer, actualLabels);
+            logger.info(`LLM Selected Answer: "${answer}"`);
+            
+            await this.withRetry(async () => {
+              // Use a more robust case-insensitive locator that also scrolls automatically
+              const normalizedAnswer = answer.replace(/\s+/g, ' ').trim();
+              const optionLocator = this.page.locator('label').filter({ 
+                hasText: new RegExp(normalizedAnswer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') 
+              }).first();
               
-              const recoveredLabel = actualLabels[bestIndex];
-              logger.info(`Smart Recovery: LLM picked Index ${bestIndex} ("${recoveredLabel}")`);
-              const recoveryLocator = this.page.locator('label').nth(bestIndex);
-              await recoveryLocator.scrollIntoViewIfNeeded();
-              await recoveryLocator.click();
-            }
-          }, 2, 1000); // Shorter retries for recovery
+              try {
+                // Use DOM CLICK to bypass "pointer-interception" errors (fieldsets/divs blocking click)
+                await optionLocator.scrollIntoViewIfNeeded({ timeout: 2000 });
+                await optionLocator.evaluate(el => el.click());
+                logger.info('Answer clicked via Native DOM event.');
+              } catch (e) {
+                logger.warn(`Regex match failed for "${answer}". Entering Smart Recovery Mode...`);
+                // SMART RECOVERY: Use LLM to find the index from the actual labels
+                const actualLabels = await this.page.$$eval('label', labels => labels.map(l => l.innerText));
+                const bestIndex = await llm.recoverQuizAction(answer, actualLabels);
+                
+                const recoveredLabel = actualLabels[bestIndex];
+                logger.info(`Smart Recovery: LLM picked Index ${bestIndex} ("${recoveredLabel}")`);
+                const recoveryLocator = this.page.locator('label').nth(bestIndex);
+                await recoveryLocator.scrollIntoViewIfNeeded({ timeout: 2000 });
+                await recoveryLocator.evaluate(el => el.click());
+              }
+            }, 2, 1000); // Shorter retries for recovery
+          }
         }
 
         const nextQ = await this.page.locator('input[value="Next page"], button:has-text("Next page")').first();
