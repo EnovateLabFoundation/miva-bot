@@ -389,11 +389,27 @@ class BrowserEngine {
         const response = await llm.solveQuiz({ question: questionText, options });
         if (response && response.answers && response.answers[0]) {
           const answer = response.answers[0].selection;
-          await this.page.locator(`label:has-text("${answer}")`).first().click();
+          
+          logger.info(`LLM Selected Answer: "${answer}"`);
+          
+          await this.withRetry(async () => {
+            // Use a more robust case-insensitive locator that also scrolls automatically
+            const optionLocator = this.page.locator('label').filter({ 
+              hasText: new RegExp(answer.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') 
+            }).first();
+            
+            if (!(await optionLocator.isVisible())) {
+              await this.page.evaluate(() => window.scrollBy(0, 300));
+            }
+            
+            await optionLocator.scrollIntoViewIfNeeded();
+            await optionLocator.click();
+          });
         }
 
         const nextQ = await this.page.locator('input[value="Next page"], button:has-text("Next page")').first();
         if (await nextQ.isVisible()) {
+          await nextQ.scrollIntoViewIfNeeded();
           await nextQ.click();
           await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
         } else {
