@@ -463,12 +463,18 @@ class BrowserEngine {
               }).first();
               
               try {
+                // Increased timeout and added nudge scroll check
+                if (!(await optionLocator.isVisible())) {
+                  logger.info('Option not immediately visible. Nudging container scroll...');
+                  await this.page.evaluate(() => window.scrollBy(0, 300));
+                }
+                
                 // Use DOM CLICK to bypass "pointer-interception" errors (fieldsets/divs blocking click)
-                await optionLocator.scrollIntoViewIfNeeded({ timeout: 2000 });
+                await optionLocator.scrollIntoViewIfNeeded({ timeout: 5000 });
                 await optionLocator.evaluate(el => el.click());
                 logger.info('Answer clicked via Native DOM event.');
               } catch (e) {
-                logger.warn(`Regex match failed for "${answer}". Entering Smart Recovery Mode...`);
+                logger.warn(`Regex match failed for "${answer}" or scroll timed out. Entering Smart Recovery Mode...`);
                 // SMART RECOVERY: Use LLM to find the index from the actual labels
                 const actualLabels = await this.page.$$eval('label', labels => labels.map(l => l.innerText));
                 const bestIndex = await llm.recoverQuizAction(answer, actualLabels);
@@ -476,7 +482,8 @@ class BrowserEngine {
                 const recoveredLabel = actualLabels[bestIndex];
                 logger.info(`Smart Recovery: LLM picked Index ${bestIndex} ("${recoveredLabel}")`);
                 const recoveryLocator = this.page.locator('label').nth(bestIndex);
-                await recoveryLocator.scrollIntoViewIfNeeded({ timeout: 2000 });
+                
+                await recoveryLocator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
                 await recoveryLocator.evaluate(el => el.click());
               }
             }, 2, 1000); // Shorter retries for recovery
