@@ -59,6 +59,18 @@ class BrowserEngine {
     this.alertCallback = cb;
   }
 
+  // V4: Chrome Error Detection
+  async isErrorState() {
+    try {
+      if (!this.page || this.page.isClosed()) return true;
+      const url = this.page.url();
+      const title = await this.page.title().catch(() => '');
+      return (url.includes('chrome-error://') || url === 'about:blank' || title.includes('Loading...'));
+    } catch (e) {
+      return true; // Assume error if we can't even query the page
+    }
+  }
+
   async smartScroll() {
     await this.page.evaluate(async () => {
       await new Promise((resolve) => {
@@ -331,21 +343,35 @@ class BrowserEngine {
     }
     this.lastUrl = currentUrl;
 
+    if (this.stuckCounter > 5) {
+      logger.warn('Detected HARD STUCK state. Clearing browser context entirely for Hard Recovery...');
+      this.stuckCounter = 0;
+      await this.refreshSession();
+      return;
+    }
+    
     if (this.stuckCounter > 3) {
       logger.warn('Detected STUCK state. Re-basing to course landing page...');
       this.stuckCounter = 0;
       // Try to find the course root via breadcrumbs or re-navigate to the last known URL
       const breadcrumb = this.page.locator('.breadcrumb-item a').first();
-      if (await breadcrumb.isVisible()) {
+      if (await breadcrumb.isVisible().catch(() => false)) {
         await this.safeInteract(breadcrumb);
       } else {
-        await this.page.goto(this.lastUrl).catch(() => {});
+        await this.page.goto(this.currentCourseId || this.lastUrl).catch(() => {});
       }
     }
   }
 
   async runActivityCycle() {
     try {
+      // V4: Immediate Hard-Reset on Error state
+      if (await this.isErrorState()) {
+         logger.warn('Detected Chrome Error Page or Page Crash. Triggering Hard Recovery...');
+         await this.refreshSession();
+         return;
+      }
+
       await this.page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
       
       const url = this.page.url();
