@@ -408,10 +408,23 @@ class BrowserEngine {
       while (hasQuestions) {
         // Wait for question to be present
         const qLocator = this.page.locator('.qtext').first();
-        if (!(await qLocator.isVisible())) {
+        const isSummary = await this.page.locator('h2:has-text("Summary of attempt"), .summarytable').first().isVisible();
+        
+        if (!(await qLocator.isVisible()) || isSummary) {
+          if (isSummary) logger.info('At Quiz Summary page. Looking for final submission...');
+          
           // Zone 2 Check: Sidebar Finish (Learned from Loom Video)
           const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt")').first();
-          if (await sidebarFinish.isVisible()) {
+          
+          // Zone 1 Check: Big Red Button (Final Submission)
+          const finalSubmit = this.page.locator('button:has-text("Submit all and finish"), input[value="Submit all and finish"]').first();
+          
+          if (await finalSubmit.isVisible()) {
+            logger.info('Performing Final Submission via Big Red Button...');
+            await finalSubmit.evaluate(el => el.click());
+            // Handled the confirmation modal if it appears
+            await this.page.locator('.moodle-dialogue-bd button:has-text("Submit all and finish")').first().click().catch(() => {});
+          } else if (await sidebarFinish.isVisible()) {
             logger.info('Finishing attempt via Sidebar link...');
             await sidebarFinish.evaluate(el => el.click());
             await this.page.locator('button:has-text("Submit all and finish")').first().click().catch(() => {});

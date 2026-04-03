@@ -3,9 +3,11 @@
 This document records the visual patterns and human navigation instincts extracted from the training videos provided by the user.
 
 ### Zone 1: The Content Container (High Priority)
-- **Buttons**: "Next page", "Continue", "Mark as done".
+- **Buttons**: "Next page", "Continue", "Mark as done", "Submit all and finish".
 - **Selectors**: `.course-content`, `#region-main`.
 - **Logic**: These are usually located inside the white content box at the center-bottom. **MUST be exhausted before looking at the Sidebar or Footer.**
+- **Quiz End-Game**: When you see "Summary of attempt", scroll to the bottom of Zone 1 for the final "Submit all and finish" button.
+- **Assignments**: If you see "Add submission", stop and alert the user.
 
 ### Zone 2: The Right Sidebar (Critical for Assessments)
 - **Buttons/Links**: "Finish attempt...", Question Numbers (1, 2, 3...).
