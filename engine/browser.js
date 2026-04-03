@@ -1,0 +1,493 @@
+const { chromium } = require('playwright');
+const winston = require('winston');
+const llm = require('./llm');
+require('dotenv').config();
+
+const logger = winston.createLogger({
+  level: 'info',
+  format: winston.format.combine(
+    winston.format.timestamp(),
+    winston.format.printf(({ timestamp, level, message }) => `${timestamp} ${level.toUpperCase()}: ${message}`)
+  ),
+  transports: [
+    new winston.transports.Console(),
+    new winston.transports.File({ filename: 'logs/combined.log' })
+  ]
+});
+
+class BrowserEngine {
+  constructor() {
+    this.browser = null;
+    this.context = null;
+    this.page = null;
+    this.isHeadless = process.env.HEADLESS === 'true';
+    this.alertCallback = null;
+    this.stuckCounter = 0;
+    this.lastUrl = '';
+    this.isRunning = false;
+  }
+
+  setAlertCallback(cb) {
+    this.alertCallback = cb;
+  }
+
+  async smartScroll() {
+    await this.page.evaluate(async () => {
+      await new Promise((resolve) => {
+        let totalHeight = 0;
+        let distance = 100;
+        let timer = setInterval(() => {
+          let scrollHeight = document.body.scrollHeight;
+          window.scrollBy(0, distance);
+          totalHeight += distance;
+          if (totalHeight >= scrollHeight) {
+            clearInterval(timer);
+            resolve();
+          }
+        }, 100);
+      });
+    });
+  }
+
+  async getInteractiveMap() {
+    return await this.page.evaluate(() => {
+      const elements = Array.from(document.querySelectorAll('a, button, [role="button"], [role="link"]'));
+      return elements
+        .filter(el => {
+          const rect = el.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== 'none';
+        })
+        .map((el, index) => ({
+          index,
+          tag: el.tagName,
+          text: el.innerText.trim().substring(0, 100),
+          role: el.getAttribute('role') || 'none',
+          id: el.id || 'none',
+          className: el.className || 'none'
+        }))
+        .filter(el => el.text.length > 0);
+    });
+  }
+
+  async withRetry(action, retries = 3, delay = 2000) {
+    for (let i = 0; i < retries; i++) {
+      try {
+        return await action();
+      } catch (error) {
+        if (i === retries - 1) throw error;
+        logger.warn(`Action failed (Attempt ${i + 1}/${retries}): ${error.message}. Retrying in ${delay}ms...`);
+        await this.page.waitForTimeout(delay);
+        delay *= 2; // Exponential backoff
+      }
+    }
+  }
+
+  async start() {
+    if (this.isRunning) {
+      throw new Error('An automation session is already in progress. Please wait for it to finish or use /stop.');
+    }
+    
+    this.isRunning = true;
+    try {
+      this.browser = await chromium.launch({ headless: this.isHeadless });
+      this.context = await this.browser.newContext();
+      this.page = await this.context.newPage();
+      logger.info('Browser started');
+    } catch (error) {
+      this.isRunning = false;
+      throw error;
+    }
+  }
+
+  async login() {
+    const email = process.env.MIVA_EMAIL;
+    const password = process.env.MIVA_PASSWORD;
+
+    if (!email || !password) {
+      throw new Error('Miva credentials (MIVA_EMAIL and MIVA_PASSWORD) are missing in .env file.');
+    }
+
+    logger.info(`Logging in for: ${email}...`);
+    try {
+      await this.withRetry(async () => {
+        // Use 'load' instead of 'networkidle' to avoid timeouts on background script noise
+        await this.page.goto('https://sis.miva.university/login', { waitUntil: 'load', timeout: 45000 });
+        
+        // Wait specifically for the elements we NEED
+        const emailInput = await this.page.waitForSelector('input[name="email"]', { state: 'visible', timeout: 15000 });
+        await emailInput.fill(email);
+        await this.page.fill('input[name="password"]', password);
+        
+        const loginBtn = this.page.locator('button:has-text("Login")');
+        await loginBtn.scrollIntoViewIfNeeded();
+        await loginBtn.click();
+        
+        logger.info('Waiting for dashboard navigation...');
+        await this.page.waitForURL('**/dashboard', { timeout: 30000 });
+      });
+      logger.info('Login successful');
+    } catch (error) {
+      await this.analyzeFailure('Login failed', error);
+      throw new Error(`Login failed: ${error.message}`);
+    }
+  }
+
+  async goToLMS() {
+    logger.info('Navigating to LMS...');
+    await this.page.goto('https://sis.miva.university/courses');
+    const goToClassBtn = this.page.locator(':text("Go to Class")').first();
+    await goToClassBtn.waitFor({ state: 'visible', timeout: 45000 });
+    
+    const [newPage] = await Promise.all([
+      this.context.waitForEvent('page'),
+      goToClassBtn.click(),
+    ]);
+    
+    this.page = newPage;
+    await this.page.waitForLoadState();
+    logger.info('Switched to LMS Tab');
+  }
+
+  async handleCourse(courseName) {
+    if (courseName.startsWith('http')) {
+      logger.info(`Navigating directly to course URL: ${courseName}`);
+      await this.page.goto(courseName);
+    } else {
+      logger.info(`Searching for course: ${courseName}`);
+      const courseCard = await this.page.locator(`div:has-text("${courseName}")`).first();
+      await courseCard.scrollIntoViewIfNeeded();
+      const viewBtn = await courseCard.locator('a:has-text("View Course")').first();
+      await viewBtn.scrollIntoViewIfNeeded();
+      await viewBtn.click();
+    }
+    await this.page.waitForLoadState();
+
+    let finished = false;
+    while (!finished) {
+      try {
+        await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+        const progress = await this.getProgress();
+        if (progress >= 70) {
+          logger.info(`Goal reached: ${progress}% progress.`);
+          if (this.alertCallback) this.alertCallback(`Success! Reached ${progress}% progress for ${courseName}.`);
+          finished = true;
+          break;
+        }
+
+        await this.ensureInActivity();
+        await this.runActivityCycle();
+        await this.checkForStuck();
+        await this.page.waitForTimeout(1000); // Small cooldown to prevent loop spamming 
+      } catch (error) {
+        if (error.message.includes('context was destroyed') || error.message.includes('navigation')) {
+          logger.warn('Navigation interrupted the cycle. Retrying after stabilization...');
+          await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+        } else {
+          throw error;
+        }
+      }
+    }
+  }
+
+  async getProgress() {
+    try {
+      // Look for progress bar in course landing page or activity header
+      const progressElement = await this.page.locator('.progress-bar-text, .course-progress-value, .progress-text').first(); 
+      if (!(await progressElement.isVisible())) return 0;
+      const text = await progressElement.innerText();
+      return parseInt(text.replace('%', '')) || 0;
+    } catch (e) {
+      return 0; 
+    }
+  }
+
+  async ensureInActivity() {
+    const url = this.page.url();
+    if (url.includes('course/view.php')) {
+      logger.info('On course landing page. Attempting to enter activities...');
+      
+      // Priority 1: Resume Button
+      const resumeBtn = await this.page.locator('button:has-text("Resume"), a:has-text("Resume"), button:has-text("Continue"), a:has-text("Continue")').first();
+      if (await resumeBtn.isVisible()) {
+        logger.info('Found Resume/Continue button. Clicking...');
+        await resumeBtn.scrollIntoViewIfNeeded();
+        await resumeBtn.click();
+        await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+        return;
+      }
+
+      // Priority 2: Sidebar/Menu First Uncompleted Activity
+      // Often in Moodle: .course-content .activity
+      const firstActivity = await this.page.locator('.course-content .activity a, .section .activity a').first();
+      if (await firstActivity.isVisible()) {
+        logger.info('Entering first available activity from menu...');
+        await firstActivity.scrollIntoViewIfNeeded();
+        await firstActivity.click();
+        await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+        return;
+      }
+
+      logger.warn('Could not find immediate way to enter activity. Waiting for manual jump or automatic redirect.');
+    }
+  }
+
+  async checkForStuck() {
+    const currentUrl = this.page.url();
+    if (currentUrl === this.lastUrl) {
+      this.stuckCounter++;
+    } else {
+      this.stuckCounter = 0;
+    }
+    this.lastUrl = currentUrl;
+
+    if (this.stuckCounter > 5) {
+      logger.warn('System might be stuck. Attempting to click "Next Activity" forcefully or alert user.');
+      this.stuckCounter = 0;
+      // Try to find any next activity button
+      const forceNext = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
+      if (await forceNext.isVisible()) {
+        logger.info(`Stuck check recovery: Clicking "${await forceNext.innerText()}"`);
+        await forceNext.scrollIntoViewIfNeeded();
+        await forceNext.click();
+      } else {
+        logger.info('Stuck check: Performing full smart scroll to find links...');
+        await this.smartScroll();
+      }
+    }
+  }
+
+  async runActivityCycle() {
+    try {
+      await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+      
+      const url = this.page.url();
+      const isActivity = url.includes('/mod/') || url.includes('view.php?id=') === false; 
+      const pageText = await this.page.innerText('body');
+
+      // 1. Mark Done always
+      const markDone = await this.page.locator('button:has-text("Mark Done"), .btn-mark-done').first();
+      if (await markDone.isVisible()) {
+        await markDone.scrollIntoViewIfNeeded();
+        await markDone.click();
+        logger.info('Clicked "Mark Done"');
+        await this.page.waitForTimeout(1500);
+      }
+
+      // 2. Alert for Uploads / Downloads
+      if (pageText.includes('upload your file') || pageText.includes('download the template')) {
+        if (this.alertCallback) {
+          await this.alertCallback(`🚨 MANUAL ACTION REQUIRED: The course "${await this.page.title()}" requires a file upload or download. Please visit the link manually to finish this task.`);
+        }
+      }
+
+      // 3. Skip Live Lessons / Office Hours - ONLY if actually in a module
+      if (isActivity && (pageText.includes('Live Lesson') || pageText.includes('Office Hours'))) {
+        logger.info('Skipping Live Lesson / Office Hours material.');
+        const nextBtn = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
+        if (await nextBtn.isVisible()) {
+          logger.info(`Skipping material: clicking "${await nextBtn.innerText()}"`);
+          await nextBtn.scrollIntoViewIfNeeded();
+          await nextBtn.click();
+          return;
+        }
+      }
+
+      // 3.5. Ensure we're at the bottom before searching for next
+      await this.smartScroll();
+
+      // 4. Content Handling
+      const isVideo = await this.page.locator('video').first();
+      const isPDF = await this.page.locator('iframe[src*="pdf"], embed[type="application/pdf"]').first();
+      const isQuiz = await this.page.locator('button:has-text("Answer the Questions"), button:has-text("Attempt"), button:has-text("Attempt Quiz"), button:has-text("Continue your attempt"), button:has-text("Re-attempt quiz")').count() > 0;
+
+      if (await isVideo.isVisible()) {
+        await this.page.evaluate(() => {
+          const v = document.querySelector('video');
+          if (v && v.duration) v.currentTime = v.duration - 1;
+        });
+        logger.info('Skipped video to end');
+      } else if (await isPDF.isVisible()) {
+        await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        logger.info('Scrolled through PDF');
+      } else if (isQuiz) {
+        await this.handleQuiz();
+      }
+
+      // 5. Evaluation Handling
+      if (pageText.includes('End of course evaluation')) {
+        await this.handleEvaluation();
+      }
+
+      // 6. Next Activity / Section - Handle both standard buttons and text-based bold links
+      const nextBtn = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
+      if (await nextBtn.isVisible()) {
+        const btnText = await nextBtn.innerText();
+        logger.info(`Cycle end: Navigating via "${btnText}"`);
+        await nextBtn.scrollIntoViewIfNeeded();
+        await nextBtn.click();
+        await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+      } else {
+        // Fallback for Moodle: Find the text-based link with bold characters which is usually the only visible navigation link on the right.
+        const rightNav = await this.page.locator('.activity-navigation a.pull-right, .nav-links a:has(strong, b)').first();
+        if (await rightNav.isVisible()) {
+          logger.info(`Found potential navigation link: "${await rightNav.innerText()}"`);
+          await rightNav.scrollIntoViewIfNeeded();
+          await rightNav.click();
+          await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+        } else {
+          logger.info('Standard navigation not found. Consulting LLM for the "Smart" next step...');
+          const map = await this.getInteractiveMap();
+          const decision = await llm.makeDecision({
+            url: this.page.url(),
+            pageTitle: await this.page.title(),
+            interactiveElements: map
+          });
+          
+          if (decision) {
+            logger.info(`LLM Decision: ${decision}`);
+            await this.executeDecision(decision, map);
+          } else {
+            logger.warn('LLM failed to provide a navigation decision.');
+          }
+        }
+      }
+    } catch (error) {
+      if (error.message.includes('context was destroyed') || error.message.includes('navigation')) {
+        // Silently catch and let the main loop retry
+        return;
+      }
+      throw error;
+    }
+  }
+
+  async handleQuiz() {
+    try {
+      logger.info('Starting Assessment attempt...');
+      const attemptBtn = await this.page.locator('button:has-text("Answer the Questions"), button:has-text("Attempt"), button:has-text("Attempt Quiz"), button:has-text("Continue your attempt"), button:has-text("Re-attempt quiz")').first();
+      await attemptBtn.scrollIntoViewIfNeeded();
+      await attemptBtn.click();
+      await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+
+      let hasQuestions = true;
+      while (hasQuestions) {
+        // Wait for question to be present
+        const qLocator = this.page.locator('.qtext').first();
+        if (!(await qLocator.isVisible())) {
+          // Check if we finished or need to submit
+          const finish = await this.page.locator('input[value="Finish attempt..."], button:has-text("Finish attempt")').first();
+          if (await finish.isVisible()) {
+            await finish.click();
+            await this.page.locator('button:has-text("Submit all and finish")').first().click();
+          }
+          hasQuestions = false;
+          break;
+        }
+
+        const questionText = await qLocator.textContent(); 
+        const options = await this.page.$$eval('.answer div', els => els.map(e => e.innerText));
+
+        const response = await llm.solveQuiz({ question: questionText, options });
+        if (response && response.answers && response.answers[0]) {
+          const answer = response.answers[0].selection;
+          await this.page.locator(`label:has-text("${answer}")`).first().click();
+        }
+
+        const nextQ = await this.page.locator('input[value="Next page"], button:has-text("Next page")').first();
+        if (await nextQ.isVisible()) {
+          await nextQ.click();
+          await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+        } else {
+          hasQuestions = false;
+        }
+      }
+    } catch (error) {
+      if (error.message.includes('context was destroyed') || error.message.includes('navigation')) {
+        return; 
+      }
+      throw error;
+    }
+  }
+
+  async handleEvaluation() {
+    logger.info('Handling End of Course Evaluation...');
+    // Generic logic to click first option on every radio group (usually 'Very Satisfied')
+    const radioGroups = await this.page.$$('.form-group');
+    for (const group of radioGroups) {
+      const radio = await group.$('input[type="radio"]');
+      if (radio) await radio.click();
+    }
+    const submit = await this.page.$('button:has-text("Submit")');
+    if (submit) await submit.click();
+  }
+
+  async executeDecision(decision, map) {
+    try {
+      // Expecting decision format: "CLICK_NEXT: Index 5" or "SCROLL_DOWN" etc.
+      if (decision.includes('CLICK_NEXT') || decision.includes('CLICK')) {
+        const match = decision.match(/Index (\d+)/);
+        if (match) {
+          const index = parseInt(match[1]);
+          const element = map.find(e => e.index === index);
+          if (element) {
+            logger.info(`Executing LLM Click on: "${element.text}" (Index ${index})`);
+            const locator = this.page.locator(`${element.tag.toLowerCase()}`).nth(index); // This is risky but best for now
+            // More precise locator using text if possible
+            const preciseLocator = this.page.locator(`${element.tag.toLowerCase()}:has-text("${element.text}")`).first();
+            await preciseLocator.scrollIntoViewIfNeeded();
+            await preciseLocator.click();
+            await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+          }
+        }
+      } else if (decision.includes('SCROLL_DOWN')) {
+        await this.smartScroll();
+      } else if (decision.includes('MARK_DONE')) {
+        const markDone = await this.page.locator('button:has-text("Mark Done"), .btn-mark-done').first();
+        if (await markDone.isVisible()) {
+          await markDone.scrollIntoViewIfNeeded();
+          await markDone.click();
+        }
+      }
+    } catch (e) {
+      logger.error(`Failed to execute LLM decision: ${e.message}`);
+    }
+  }
+
+  async analyzeFailure(context, error) {
+    const url = this.page ? this.page.url() : 'N/A';
+    logger.error(`[FAILURE ANALYZER] Context: ${context}. URL: ${url}. Error: ${error.message}`);
+    
+    try {
+      // Small logic to use LLM to identify if this is a common issue
+      const screenshot = await this.page.screenshot({ type: 'jpeg', quality: 50 }).catch(() => null);
+      if (screenshot) {
+        logger.info('Captured screenshot of failure for later review.');
+      }
+      
+      const map = await this.getInteractiveMap().catch(() => []);
+      const analysis = await llm.makeDecision({
+        type: 'ERROR_ANALYSIS',
+        context,
+        errorMessage: error.message,
+        url,
+        interactiveElements: map
+      });
+      
+      if (analysis) {
+        logger.info(`LLM Failure Analysis: ${analysis}`);
+        // If the LLM suggests a simple fix (like "CLICK_SOMETHING_ELSE"), we could attempt it here
+      }
+    } catch (e) {
+      logger.warn(`Failure Analyzer itself failed: ${e.message}`);
+    }
+  }
+
+  async stop() {
+    this.isRunning = false;
+    if (this.browser) {
+      await this.browser.close();
+      this.browser = null;
+    }
+  }
+}
+
+module.exports = new BrowserEngine();
