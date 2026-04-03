@@ -86,7 +86,7 @@ class BrowserEngine {
     // Human Instinct Logic: Prioritize Container -> Sidebar -> Footer
     
     // Zone 1: Content Container (Next Page / Continue)
-    const containerNext = this.page.locator('.course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:contains("Next page")').first();
+    const containerNext = this.page.locator('.course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:has-text("Next page")').first();
     
     // Zone 2: Sidebar (Finish attempt or Question jumping)
     const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt"), .block_quiz_navigation a:has-text("Submit"), .block_navigation a:has-text("Finish")').first();
