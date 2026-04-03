@@ -85,8 +85,8 @@ class BrowserEngine {
   async searchForNavigation() {
     // Human Instinct Logic: Prioritize Container -> Sidebar -> Footer
     
-    // Zone 1: Content Container (Next Page / Continue)
-    const containerNext = this.page.locator('.course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:has-text("Next page")').first();
+    // Zone 1: Content Container (Next Page / Continue / Finish)
+    const containerNext = this.page.locator('.course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:has-text("Next page"), .course-content button:has-text("Finish attempt")').first();
     
     // Zone 2: Sidebar (Finish attempt or Question jumping)
     const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt"), .block_quiz_navigation a:has-text("Submit"), .block_navigation a:has-text("Finish")').first();
@@ -341,7 +341,8 @@ class BrowserEngine {
           const v = document.querySelector('video');
           if (v && v.duration) v.currentTime = v.duration - 1;
         });
-        logger.info('Skipped video to end');
+        logger.info('Video skipped to end. Waiting for LMS sync...');
+        await this.page.waitForTimeout(3000); // 3s buffer for LMS to register completion
       } else if (await isPDF.isVisible()) {
         await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
         logger.info('Scrolled through PDF');
@@ -491,10 +492,24 @@ class BrowserEngine {
         }
 
         const nextQ = await this.page.locator('input[value="Next page"], button:has-text("Next page")').first();
+        const finishAttempt = await this.page.locator('button:has-text("Finish attempt"), input[value="Finish attempt"]').first();
+
         if (await nextQ.isVisible()) {
           await nextQ.scrollIntoViewIfNeeded();
           await nextQ.evaluate(el => el.click()); // Using native click for stability
           await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+        } else if (await finishAttempt.isVisible()) {
+          logger.info('No "Next page" found, but "Finish attempt" is visible. Finalizing Quiz...');
+          await finishAttempt.evaluate(el => el.click());
+          
+          // Look for final submission button (Big Red Button)
+          const finalSubmit = this.page.locator('button:has-text("Submit all and finish"), input[value="Submit all and finish"]').first();
+          if (await finalSubmit.isVisible({ timeout: 5000 })) {
+             await finalSubmit.evaluate(el => el.click());
+             await this.page.locator('.moodle-dialogue-bd button:has-text("Submit all and finish")').first().click().catch(() => {});
+          }
+          hasQuestions = false;
+          break;
         } else {
           hasQuestions = false;
         }
