@@ -25,6 +25,27 @@ class BrowserEngine {
     this.stuckCounter = 0;
     this.lastUrl = '';
     this.isRunning = false;
+    this.lastProgressTime = Date.now();
+  }
+
+  async safeInteract(locator, action = 'click') {
+    try {
+      if (!this.page || this.page.isClosed()) return false;
+      
+      // Ensure element is attached and semi-visible
+      await locator.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+      
+      if (action === 'click') {
+        logger.info(`SafeInteract: Performing native click on ${await locator.count()} element(s)`);
+        await locator.evaluate(el => el.click());
+      } else if (action === 'scroll') {
+        await locator.scrollIntoViewIfNeeded({ timeout: 2000 }).catch(() => {});
+      }
+      return true;
+    } catch (e) {
+      logger.warn(`Safety Shield caught interaction error: ${e.message}. Re-orienting...`);
+      return false;
+    }
   }
 
   setAlertCallback(cb) {
@@ -51,21 +72,24 @@ class BrowserEngine {
 
   async getInteractiveMap() {
     return await this.page.evaluate(() => {
-      const elements = Array.from(document.querySelectorAll('a, button, [role="button"], [role="link"]'));
+      const elements = Array.from(document.querySelectorAll('a, button, [role="button"], label'));
       return elements
         .filter(el => {
           const rect = el.getBoundingClientRect();
           return rect.width > 0 && rect.height > 0 && window.getComputedStyle(el).display !== 'none';
         })
-        .map((el, index) => ({
-          index,
-          tag: el.tagName,
-          text: el.innerText.trim().substring(0, 100),
-          role: el.getAttribute('role') || 'none',
-          id: el.id || 'none',
-          className: el.className || 'none'
-        }))
-        .filter(el => el.text.length > 0);
+        .map((el, index) => {
+          const rect = el.getBoundingClientRect();
+          return {
+            index,
+            tag: el.tagName,
+            text: el.innerText.trim().substring(0, 80),
+            x: Math.round(rect.left),
+            y: Math.round(rect.top),
+            width: Math.round(rect.width),
+            height: Math.round(rect.height)
+          };
+        }).filter(el => el.text.length > 0 || el.tag === 'BUTTON');
     });
   }
 
@@ -166,8 +190,7 @@ class BrowserEngine {
         await this.page.fill('input[name="password"]', password);
         
         const loginBtn = this.page.locator('button:has-text("Login")');
-        await loginBtn.scrollIntoViewIfNeeded();
-        await loginBtn.click();
+        await this.safeInteract(loginBtn, 'click');
         
         logger.info('Waiting for dashboard navigation...');
         await this.page.waitForURL('**/dashboard', { timeout: 30000 });
@@ -187,7 +210,7 @@ class BrowserEngine {
     
     const [newPage] = await Promise.all([
       this.context.waitForEvent('page'),
-      goToClassBtn.click(),
+      this.safeInteract(goToClassBtn, 'click'),
     ]);
     
     this.page = newPage;
@@ -202,10 +225,9 @@ class BrowserEngine {
     } else {
       logger.info(`Searching for course: ${courseName}`);
       const courseCard = await this.page.locator(`div:has-text("${courseName}")`).first();
-      await courseCard.scrollIntoViewIfNeeded();
+      await this.safeInteract(courseCard, 'scroll');
       const viewBtn = await courseCard.locator('a:has-text("View Course")').first();
-      await viewBtn.scrollIntoViewIfNeeded();
-      await viewBtn.click();
+      await this.safeInteract(viewBtn, 'click');
     }
     await this.page.waitForLoadState();
 
@@ -287,18 +309,15 @@ class BrowserEngine {
     }
     this.lastUrl = currentUrl;
 
-    if (this.stuckCounter > 5) {
-      logger.warn('System might be stuck. Attempting to click "Next Activity" forcefully or alert user.');
+    if (this.stuckCounter > 3) {
+      logger.warn('Detected STUCK state. Re-basing to course landing page...');
       this.stuckCounter = 0;
-      // Try to find any next activity button
-      const forceNext = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
-      if (await forceNext.isVisible()) {
-        logger.info(`Stuck check recovery: Clicking "${await forceNext.innerText()}"`);
-        await forceNext.scrollIntoViewIfNeeded();
-        await forceNext.click();
+      // Try to find the course root via breadcrumbs or re-navigate to the last known URL
+      const breadcrumb = this.page.locator('.breadcrumb-item a').first();
+      if (await breadcrumb.isVisible()) {
+        await this.safeInteract(breadcrumb);
       } else {
-        logger.info('Stuck check: Performing full smart scroll to find links...');
-        await this.smartScroll();
+        await this.page.goto(this.lastUrl).catch(() => {});
       }
     }
   }
@@ -313,10 +332,9 @@ class BrowserEngine {
 
       // 1. Mark Done always
       const markDone = await this.page.locator('button:has-text("Mark Done"), .btn-mark-done').first();
-      if (await markDone.isVisible()) {
-        await markDone.scrollIntoViewIfNeeded();
-        await markDone.click();
-        logger.info('Clicked "Mark Done"');
+      if (await markDone.isVisible().catch(() => false)) {
+        await this.safeInteract(markDone, 'click');
+        logger.info('Clicked "Mark Done" (Safe)');
         await this.page.waitForTimeout(1500);
       }
 
@@ -331,10 +349,9 @@ class BrowserEngine {
       if (isActivity && (pageText.includes('Live Lesson') || pageText.includes('Office Hours'))) {
         logger.info('Skipping Live Lesson / Office Hours material.');
         const nextBtn = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
-        if (await nextBtn.isVisible()) {
-          logger.info(`Skipping material: clicking "${await nextBtn.innerText()}"`);
-          await nextBtn.scrollIntoViewIfNeeded();
-          await nextBtn.click();
+        if (await nextBtn.isVisible().catch(() => false)) {
+          logger.info(`Skipping material: clicking "${await nextBtn.innerText().catch(() => 'Next')}"`);
+          await this.safeInteract(nextBtn, 'click');
           return;
         }
       }
@@ -371,10 +388,8 @@ class BrowserEngine {
       // 6. Next Activity / Section - Handle both standard buttons and text-based bold links with Smart Search
       const nextBtn = await this.searchForNavigation();
       if (nextBtn) {
-        logger.info(`Cycle end: Navigating via found button: "${await nextBtn.innerText()}"`);
-        await nextBtn.scrollIntoViewIfNeeded();
-        // Use native click to bypass interception
-        await nextBtn.evaluate(el => el.click());
+        logger.info(`Cycle end: Navigating via found button: "${await nextBtn.innerText().catch(() => 'Next Activity')}"`);
+        await this.safeInteract(nextBtn, 'click');
         await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
       } else {
         // Fallback for Moodle: Find the text-based link with bold characters which is usually the only visible navigation link on the right.
@@ -430,24 +445,25 @@ class BrowserEngine {
           
           // STEP 1: Click "Submit all and finish" on Summary Page
           const finalSubmit = this.page.locator('button:has-text("Submit all and finish"), input[value="Submit all and finish"]').first();
-          if (await finalSubmit.isVisible()) {
+          if (await finalSubmit.isVisible().catch(() => false)) {
             logger.info('Performing Final Submission (Step 1)...');
-            await finalSubmit.evaluate(el => el.click());
+            await this.safeInteract(finalSubmit, 'click');
             
             // STEP 2: Handle the confirmation modal (Big Red Button again)
             logger.info('Waiting for confirmation modal...');
             const confirmBtn = this.page.locator('.moodle-dialogue-bd button:has-text("Submit all and finish"), .modal-content button:has-text("Submit all and finish")').first();
-            await confirmBtn.waitFor({ state: 'visible', timeout: 5000 }).catch(() => {});
-            if (await confirmBtn.isVisible()) {
-                await confirmBtn.click();
+            await confirmBtn.waitFor({ state: 'attached', timeout: 5000 }).catch(() => {});
+            if (await confirmBtn.isVisible().catch(() => false)) {
+                await this.safeInteract(confirmBtn, 'click');
                 logger.info('Assessment confirmed and submitted.');
             }
           } else {
              // Fallback for summary-without-button cases
              const finish = await this.page.locator('input[value="Finish attempt..."], button:has-text("Finish attempt")').first();
-             if (await finish.isVisible()) {
-               await finish.evaluate(el => el.click());
-               await this.page.locator('button:has-text("Submit all and finish")').first().click().catch(() => {});
+             if (await finish.isVisible().catch(() => false)) {
+               await this.safeInteract(finish, 'click');
+               const finalConfirm = this.page.locator('button:has-text("Submit all and finish")').first();
+               await this.safeInteract(finalConfirm, 'click');
              }
           }
           assessmentFinished = true;
@@ -485,11 +501,7 @@ class BrowserEngine {
               }).first();
               
               try {
-                if (!(await optionLocator.isVisible())) {
-                  await qLoc.scrollIntoViewIfNeeded(); // Extra framing
-                }
-                await optionLocator.scrollIntoViewIfNeeded({ timeout: 5000 });
-                await optionLocator.evaluate(el => el.click());
+                await this.safeInteract(optionLocator, 'click');
                 logger.info(`Q${index + 1} answered.`);
               } catch (e) {
                 // Local recovery for this specific question
@@ -497,8 +509,7 @@ class BrowserEngine {
                 const bestIndex = await llm.recoverQuizAction(answer, actualLabels);
                 logger.info(`Smart Recovery for Q${index + 1}: LLM picked Index ${bestIndex}`);
                 const recoveryLocator = qLoc.locator('label').nth(bestIndex);
-                await recoveryLocator.scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
-                await recoveryLocator.evaluate(el => el.click());
+                await this.safeInteract(recoveryLocator, 'click');
               }
             }, 2, 1000);
           }
@@ -549,11 +560,8 @@ class BrowserEngine {
           const element = map.find(e => e.index === index);
           if (element) {
             logger.info(`Executing LLM Click on: "${element.text}" (Index ${index})`);
-            const locator = this.page.locator(`${element.tag.toLowerCase()}`).nth(index); // This is risky but best for now
-            // More precise locator using text if possible
             const preciseLocator = this.page.locator(`${element.tag.toLowerCase()}:has-text("${element.text}")`).first();
-            await preciseLocator.scrollIntoViewIfNeeded();
-            await preciseLocator.click();
+            await this.safeInteract(preciseLocator, 'click');
             await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
           }
         }
