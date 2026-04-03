@@ -128,6 +128,9 @@ class BrowserEngine {
   async searchForNavigation() {
     // Human Instinct Logic: Prioritize Container -> Sidebar -> Footer
     
+    // Zone 0: Remui Theme Navbar (High Priority)
+    const navbarNext = this.page.locator('#courseNext a, .activity-navigation a:has-text("Next")').first();
+    
     // Zone 1: Content Container (Bold Links / Next Page / Continue / Finish)
     const containerNext = this.page.locator('.course-content a:has(strong, b), .course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:has-text("Next page"), .course-content button:has-text("Finish attempt")').first();
     
@@ -139,7 +142,7 @@ class BrowserEngine {
 
     logger.info('Searching for navigation buttons via Zone-Aware Smart Scroll...');
     
-    const zones = [containerNext, sidebarFinish, footerNext];
+    const zones = [navbarNext, containerNext, sidebarFinish, footerNext];
     
     for (let i = 0; i < 15; i++) {
        for (const [index, loc] of zones.entries()) {
@@ -313,15 +316,18 @@ class BrowserEngine {
         return;
       }
 
-      logger.info('Scanning for the first UNCOMPLETED activity...');
-      const activities = await this.page.locator('.course-content .activity').all();
+      logger.info('Scanning for the first UNCOMPLETED activity (Remui Aware)...');
+      
+      // V5: Use more precise activity-item selector from ground-truth HTML
+      const activities = await this.page.locator('.activity-item, .course-content .activity').all();
       for (const activity of activities) {
-        // Check for green checkmark or completion badge
-        const isDone = await activity.locator('.completion-info .completionicon, .completion-info img[alt="Completed"], .completion-info .badge-success').isVisible().catch(() => false);
+        // V5: Target specific 'complete_icon' from ground-truth HTML
+        const isDone = await activity.locator('.activity-completion-indicator.complete_icon, .fa-check, .completion-info .badge-success').isVisible().catch(() => false);
         if (!isDone) {
           const link = activity.locator('a').first();
           if (await link.isVisible().catch(() => false)) {
-            logger.info(`Entering next task: ${await link.innerText().catch(() => 'Activity')}`);
+            const label = await link.innerText().catch(() => 'Activity');
+            logger.info(`Entering next task: ${label}`);
             await this.safeInteract(link, 'click');
             await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
             return;
