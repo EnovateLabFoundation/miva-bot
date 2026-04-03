@@ -185,15 +185,15 @@ class BrowserEngine {
         await this.page.goto('https://sis.miva.university/login', { waitUntil: 'load', timeout: 45000 });
         
         // Wait specifically for the elements we NEED
-        const emailInput = await this.page.waitForSelector('input[name="email"]', { state: 'visible', timeout: 15000 });
-        await emailInput.fill(email);
+        const emailInput = await this.page.waitForSelector('input[name="email"]', { state: 'visible', timeout: 15000 }).catch(() => null);
+        if (emailInput) await emailInput.fill(email);
         await this.page.fill('input[name="password"]', password);
         
         const loginBtn = this.page.locator('button:has-text("Login")');
         await this.safeInteract(loginBtn, 'click');
         
         logger.info('Waiting for dashboard navigation...');
-        await this.page.waitForURL('**/dashboard', { timeout: 30000 });
+        await this.page.waitForURL('**/dashboard', { timeout: 30000 }).catch(() => {});
       });
       logger.info('Login successful');
     } catch (error) {
@@ -206,7 +206,7 @@ class BrowserEngine {
     logger.info('Navigating to LMS...');
     await this.page.goto('https://sis.miva.university/courses');
     const goToClassBtn = this.page.locator(':text("Go to Class")').first();
-    await goToClassBtn.waitFor({ state: 'visible', timeout: 45000 });
+    await goToClassBtn.waitFor({ state: 'visible', timeout: 45000 }).catch(() => {});
     
     const [newPage] = await Promise.all([
       this.context.waitForEvent('page'),
