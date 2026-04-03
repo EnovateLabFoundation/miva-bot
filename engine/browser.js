@@ -292,7 +292,15 @@ class BrowserEngine {
 
   async getProgress() {
     try {
-      // Look for progress bar in course landing page or activity header
+      // Zone 0: Focus Mode Header (V5.2)
+      const fmProgress = await this.page.locator('.fm-navbar .progress-text').first();
+      if (await fmProgress.isVisible()) {
+          const text = await fmProgress.innerText();
+          const progressValue = parseInt(text.replace('%', ''));
+          if (!isNaN(progressValue)) return progressValue;
+      }
+      
+      // Look for progress bar in course landing page or other headers
       const progressElement = await this.page.locator('.progress-bar-text, .course-progress-value, .progress-text').first(); 
       if (!(await progressElement.isVisible())) return 0;
       const text = await progressElement.innerText();
@@ -303,40 +311,80 @@ class BrowserEngine {
   }
 
   async ensureInActivity() {
-    const url = this.page.url();
-    if (url.includes('course/view.php')) {
-      logger.info('On course landing page. Checking for Resume priority...');
+    try {
+      const url = this.page.url();
       
-      // V3.2: Immediate priority on "Resume" button if available
-      const resumeBtn = await this.page.locator('button:has-text("Resume"), a:has-text("Resume"), button:has-text("Continue"), a:has-text("Continue")').first();
-      if (await resumeBtn.isVisible().catch(() => false)) {
-        logger.info('Found primary Resume/Continue button. Entering activity...');
-        await this.safeInteract(resumeBtn, 'click');
-        await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-        return;
+      // V5.2: Universal Drawer Intelligence (Higher priority than URL states)
+      const drawer = this.page.locator('#accordionEx1');
+      if (await drawer.isVisible()) {
+          const activities = await drawer.locator('.activity-item').all();
+          let activeIndex = -1;
+          
+          // First, find where we currently are
+          for (let k = 0; k < activities.length; k++) {
+              const isActive = await activities[k].evaluate(el => el.closest('.card').classList.contains('active')).catch(() => false);
+              if (isActive) {
+                  activeIndex = k;
+                  break;
+              }
+          }
+          
+          // If we are at a finish line or in a loop, find the NEXT uncompleted task in the drawer
+          // (Only if we aren't in a quiz session, to avoid accidental exits)
+          if (!url.includes('mod/quiz/attempt.php')) {
+              for (const activity of activities) {
+                  const isDone = await activity.locator('.complete_icon, .fa-check').isVisible().catch(() => false);
+                  const isActive = await activity.evaluate(el => el.closest('.card').classList.contains('active')).catch(() => false);
+                  
+                  if (!isDone && !isActive) {
+                      const link = activity.locator('a').first();
+                      if (await link.isVisible()) {
+                          const label = await link.innerText().catch(() => 'Activity');
+                          logger.info(`Navigating via Drawer to: ${label}`);
+                          await this.safeInteract(link, 'click');
+                          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+                          return;
+                      }
+                  }
+              }
+          }
       }
 
-      logger.info('Scanning for the first UNCOMPLETED activity (Remui Aware)...');
-      
-      // V5: Use more precise activity-item selector from ground-truth HTML
-      const activities = await this.page.locator('.activity-item, .course-content .activity').all();
-      for (const activity of activities) {
-        // V5: Target specific 'complete_icon' from ground-truth HTML
-        const isDone = await activity.locator('.activity-completion-indicator.complete_icon, .fa-check, .completion-info .badge-success').isVisible().catch(() => false);
-        if (!isDone) {
-          const link = activity.locator('a').first();
-          if (await link.isVisible().catch(() => false)) {
-            const label = await link.innerText().catch(() => 'Activity');
-            logger.info(`Entering next task: ${label}`);
-            await this.safeInteract(link, 'click');
-            await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-            return;
+      if (url.includes('course/view.php')) {
+        logger.info('On course landing page. Checking for Resume priority...');
+        
+        // V3.2: Immediate priority on "Resume" button if available
+        const resumeBtn = await this.page.locator('button:has-text("Resume"), a:has-text("Resume"), button:has-text("Continue"), a:has-text("Continue")').first();
+        if (await resumeBtn.isVisible().catch(() => false)) {
+          logger.info('Found primary Resume/Continue button. Entering activity...');
+          await this.safeInteract(resumeBtn, 'click');
+          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+          return;
+        }
+
+        logger.info('Scanning for the first UNCOMPLETED activity (Remui Aware)...');
+        
+        // V5: Use more precise activity-item selector from ground-truth HTML
+        const activities = await this.page.locator('.activity-item, .course-content .activity').all();
+        for (const activity of activities) {
+          // V5: Target specific 'complete_icon' from ground-truth HTML
+          const isDone = await activity.locator('.activity-completion-indicator.complete_icon, .fa-check, .completion-info .badge-success').isVisible().catch(() => false);
+          if (!isDone) {
+            const link = activity.locator('a').first();
+            if (await link.isVisible().catch(() => false)) {
+              const label = await link.innerText().catch(() => 'Activity');
+              logger.info(`Entering next task: ${label}`);
+              await this.safeInteract(link, 'click');
+              await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+              return;
+            }
           }
         }
-      }
 
-      // Check for bold links etc. (The Resume button logic was moved to the top of this function as a priority)
-      logger.warn('Could not find first uncompleted activity. Waiting for manual jump.');
+        logger.warn('Could not find first uncompleted activity. Waiting for manual jump.');
+      }
+    } catch (e) {
+      logger.error(`Error in ensureInActivity: ${e.message}`);
     }
   }
 
