@@ -122,8 +122,8 @@ class BrowserEngine {
     // Zone 2: Sidebar (Finish attempt or Question jumping)
     const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt"), .block_quiz_navigation a:has-text("Submit"), .block_navigation a:has-text("Finish")').first();
 
-    // Zone 3: Footer (Next activity)
-    const footerNext = this.page.locator('.section-navigation a:has-text("Next activity"), .section-navigation a:has-text("Next Section"), .nav-links a:has-text("Next")').first();
+    // Zone 3: Footer (Next activity / Next Section / Resume)
+    const footerNext = this.page.locator('.section-navigation a:has-text("Next activity"), .section-navigation a:has-text("Next Section"), .nav-links a:has-text("Next"), a:has-text("Resume")').first();
 
     logger.info('Searching for navigation buttons via Zone-Aware Smart Scroll...');
     
@@ -290,8 +290,18 @@ class BrowserEngine {
   async ensureInActivity() {
     const url = this.page.url();
     if (url.includes('course/view.php')) {
-      logger.info('On course landing page. Scanning for the first UNCOMPLETED activity...');
+      logger.info('On course landing page. Checking for Resume priority...');
       
+      // V3.2: Immediate priority on "Resume" button if available
+      const resumeBtn = await this.page.locator('button:has-text("Resume"), a:has-text("Resume"), button:has-text("Continue"), a:has-text("Continue")').first();
+      if (await resumeBtn.isVisible().catch(() => false)) {
+        logger.info('Found primary Resume/Continue button. Entering activity...');
+        await this.safeInteract(resumeBtn, 'click');
+        await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
+        return;
+      }
+
+      logger.info('Scanning for the first UNCOMPLETED activity...');
       const activities = await this.page.locator('.course-content .activity').all();
       for (const activity of activities) {
         // Check for green checkmark or completion badge
@@ -307,15 +317,7 @@ class BrowserEngine {
         }
       }
 
-      // Priority 1: Resume Button (Fallback)
-      const resumeBtn = await this.page.locator('button:has-text("Resume"), a:has-text("Resume"), button:has-text("Continue"), a:has-text("Continue")').first();
-      if (await resumeBtn.isVisible().catch(() => false)) {
-        logger.info('Found Resume/Continue button. Clicking...');
-        await this.safeInteract(resumeBtn, 'click');
-        await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
-        return;
-      }
-
+      // Check for bold links etc. (The Resume button logic was moved to the top of this function as a priority)
       logger.warn('Could not find first uncompleted activity. Waiting for manual jump.');
     }
   }
