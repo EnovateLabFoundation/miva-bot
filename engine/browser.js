@@ -98,15 +98,23 @@ class BrowserEngine {
     
     const zones = [containerNext, sidebarFinish, footerNext];
     
-    for (let i = 0; i < 5; i++) {
+    for (let i = 0; i < 15; i++) {
        for (const [index, loc] of zones.entries()) {
-        if (await loc.isVisible()) {
+        if (await loc.isVisible().catch(() => false)) {
           logger.info(`Found navigation button in Zone ${index + 1}`);
           return loc;
         }
       }
-      await this.page.evaluate(() => window.scrollBy(0, 800));
-      await this.page.waitForTimeout(500);
+
+      // Check if we hit the bottom before scrolling again
+      const isAtBottom = await this.page.evaluate(() => (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 50));
+      if (isAtBottom) {
+        logger.info('Reached bottom of page. Final scan complete.');
+        break;
+      }
+
+      await this.page.evaluate(() => window.scrollBy(0, 400));
+      await this.page.waitForTimeout(400);
     }
     
     // Search for bold links as last resort (indicates current active navigation in Sidebar)
@@ -332,18 +340,18 @@ class BrowserEngine {
       await this.smartScroll();
 
       // 4. Content Handling
-      const isVideo = await this.page.locator('video').first();
-      const isPDF = await this.page.locator('iframe[src*="pdf"], embed[type="application/pdf"]').first();
-      const isQuiz = await this.page.locator('button:has-text("Answer the Questions"), button:has-text("Attempt"), button:has-text("Attempt Quiz"), button:has-text("Continue your attempt"), button:has-text("Re-attempt quiz")').count() > 0;
+      const isVideoVisible = await this.page.locator('video').first().isVisible().catch(() => false);
+      const isPDFVisible = await this.page.locator('iframe[src*="pdf"], embed[type="application/pdf"]').first().isVisible().catch(() => false);
+      const isQuiz = (await this.page.locator('.que').count().catch(() => 0)) > 0 || (await this.page.locator('button:has-text("Attempt")').count().catch(() => 0)) > 0;
 
-      if (await isVideo.isVisible()) {
+      if (isVideoVisible) {
         await this.page.evaluate(() => {
           const v = document.querySelector('video');
           if (v && v.duration) v.currentTime = v.duration - 1;
         });
         logger.info('Video skipped to end. Waiting for LMS sync...');
         await this.page.waitForTimeout(3000); // 3s buffer for LMS to register completion
-      } else if (await isPDF.isVisible()) {
+      } else if (isPDFVisible) {
         await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
         logger.info('Scrolled through PDF');
       } else if (isQuiz) {
