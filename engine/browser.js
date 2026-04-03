@@ -319,12 +319,21 @@ class BrowserEngine {
       }
 
       // 6. Next Activity / Section - Handle both standard buttons and text-based bold links
-      const nextBtn = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
-      if (await nextBtn.isVisible()) {
-        const btnText = await nextBtn.innerText();
-        logger.info(`Cycle end: Navigating via "${btnText}"`);
-        await nextBtn.scrollIntoViewIfNeeded();
-        await nextBtn.click();
+      // Priority 1: Next Page / Continue within the same lesson
+      const priorityNext = await this.page.locator('a:has-text("Next Page"), a:has-text("Next page"), a:has-text("Continue"), button:has-text("Continue")').first();
+      
+      // Priority 2: Next Activity / Next Section
+      const generalNext = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
+      
+      if (await priorityNext.isVisible()) {
+        logger.info(`Priority Navigation: "${await priorityNext.innerText()}"`);
+        await priorityNext.scrollIntoViewIfNeeded();
+        await priorityNext.click();
+        await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+      } else if (await generalNext.isVisible()) {
+        logger.info(`General Navigation: "${await generalNext.innerText()}"`);
+        await generalNext.scrollIntoViewIfNeeded();
+        await generalNext.click();
         await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
       } else {
         // Fallback for Moodle: Find the text-based link with bold characters which is usually the only visible navigation link on the right.
