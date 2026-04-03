@@ -109,8 +109,8 @@ class BrowserEngine {
   async searchForNavigation() {
     // Human Instinct Logic: Prioritize Container -> Sidebar -> Footer
     
-    // Zone 1: Content Container (Next Page / Continue / Finish)
-    const containerNext = this.page.locator('.course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:has-text("Next page"), .course-content button:has-text("Finish attempt")').first();
+    // Zone 1: Content Container (Bold Links / Next Page / Continue / Finish)
+    const containerNext = this.page.locator('.course-content a:has(strong, b), .course-content a:has-text("Next Page"), .course-content button:has-text("Continue"), .course-content a:has-text("Continue"), .course-content button:has-text("Next page"), .course-content button:has-text("Finish attempt")').first();
     
     // Zone 2: Sidebar (Finish attempt or Question jumping)
     const sidebarFinish = this.page.locator('.block_quiz_navigation a:has-text("Finish attempt"), .block_quiz_navigation a:has-text("Submit"), .block_navigation a:has-text("Finish")').first();
@@ -273,30 +273,33 @@ class BrowserEngine {
   async ensureInActivity() {
     const url = this.page.url();
     if (url.includes('course/view.php')) {
-      logger.info('On course landing page. Attempting to enter activities...');
+      logger.info('On course landing page. Scanning for the first UNCOMPLETED activity...');
       
-      // Priority 1: Resume Button
+      const activities = await this.page.locator('.course-content .activity').all();
+      for (const activity of activities) {
+        // Check for green checkmark or completion badge
+        const isDone = await activity.locator('.completion-info .completionicon, .completion-info img[alt="Completed"], .completion-info .badge-success').isVisible().catch(() => false);
+        if (!isDone) {
+          const link = activity.locator('a').first();
+          if (await link.isVisible().catch(() => false)) {
+            logger.info(`Entering next task: ${await link.innerText().catch(() => 'Activity')}`);
+            await this.safeInteract(link, 'click');
+            await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+            return;
+          }
+        }
+      }
+
+      // Priority 1: Resume Button (Fallback)
       const resumeBtn = await this.page.locator('button:has-text("Resume"), a:has-text("Resume"), button:has-text("Continue"), a:has-text("Continue")').first();
-      if (await resumeBtn.isVisible()) {
+      if (await resumeBtn.isVisible().catch(() => false)) {
         logger.info('Found Resume/Continue button. Clicking...');
-        await resumeBtn.scrollIntoViewIfNeeded();
         await this.safeInteract(resumeBtn, 'click');
         await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
         return;
       }
 
-      // Priority 2: Sidebar/Menu First Uncompleted Activity
-      // Often in Moodle: .course-content .activity
-      const firstActivity = await this.page.locator('.course-content .activity a, .section .activity a').first();
-      if (await firstActivity.isVisible()) {
-        logger.info('Entering first available activity from menu...');
-        await firstActivity.scrollIntoViewIfNeeded();
-        await this.safeInteract(firstActivity, 'click');
-        await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
-        return;
-      }
-
-      logger.warn('Could not find immediate way to enter activity. Waiting for manual jump or automatic redirect.');
+      logger.warn('Could not find first uncompleted activity. Waiting for manual jump.');
     }
   }
 
@@ -382,6 +385,11 @@ class BrowserEngine {
         logger.info('Scrolled through PDF');
       } else if (isQuiz) {
         await this.handleQuiz();
+      }
+
+      // 4.5. Discussion Forum Handling
+      if (url.includes('/mod/forum/') || pageText.includes('Add a new discussion topic')) {
+        await this.handleDiscussionForum();
       }
 
       // 5. Evaluation Handling
@@ -539,6 +547,30 @@ class BrowserEngine {
         return; 
       }
       throw error;
+    }
+  }
+  async handleDiscussionForum() {
+    logger.info('Handling Discussion Forum Activity...');
+    try {
+      const addDiscussion = this.page.locator('button:has-text("Add a new discussion topic"), a:has-text("Add a new discussion topic")').first();
+      const replyLink = this.page.locator('a:has-text("Reply")').first();
+
+      if (await addDiscussion.isVisible().catch(() => false)) {
+          await this.safeInteract(addDiscussion, 'click');
+          await this.page.fill('input[name="subject"]', 'Module Review').catch(() => {});
+          await this.page.fill('textarea[name="message"]', 'Okay').catch(() => {});
+          const postBtn = this.page.locator('button:has-text("Post to forum")').first();
+          await this.safeInteract(postBtn, 'click');
+          logger.info('New forum post "Okay" submitted.');
+      } else if (await replyLink.isVisible().catch(() => false)) {
+          await this.safeInteract(replyLink, 'click');
+          await this.page.fill('textarea[name="message"]', 'Okay').catch(() => {});
+          const postBtn = this.page.locator('button:has-text("Post to forum")').first();
+          await this.safeInteract(postBtn, 'click');
+          logger.info('Forum reply "Okay" submitted.');
+      }
+    } catch (e) {
+      logger.warn(`Failed to handle Discussion Forum: ${e.message}`);
     }
   }
 
