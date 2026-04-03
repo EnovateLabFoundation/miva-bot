@@ -654,11 +654,12 @@ class BrowserEngine {
 
   async executeDecision(decision, map) {
     try {
-      // Expecting decision format: "CLICK_NEXT: Index 5" or "SCROLL_DOWN" etc.
-      if (decision.includes('CLICK_NEXT') || decision.includes('CLICK')) {
-        const match = decision.match(/Index (\d+)/);
+      const decisionLower = decision.toLowerCase();
+      // V5.1: Case-insensitive and phrase-flexible Action/Index matching
+      if (decisionLower.includes('click_next') || decisionLower.includes('click')) {
+        const match = decision.match(/(index|index of) (\d+)/i);
         if (match) {
-          const index = parseInt(match[1]);
+          const index = parseInt(match[2]);
           const element = map.find(e => e.index === index);
           if (element) {
             const oldUrl = this.page.url();
@@ -679,13 +680,13 @@ class BrowserEngine {
             }
           }
         }
-      } else if (decision.includes('SCROLL_DOWN')) {
+      } else if (decisionLower.includes('scroll_down')) {
         await this.smartScroll();
-      } else if (decision.includes('MARK_DONE')) {
+      } else if (decisionLower.includes('mark_done')) {
         const markDone = await this.page.locator('button:has-text("Mark Done"), .btn-mark-done').first();
         if (await markDone.isVisible()) {
           await markDone.scrollIntoViewIfNeeded();
-        await this.safeInteract(markDone, 'click');
+          await this.safeInteract(markDone, 'click');
         }
       }
     } catch (e) {
