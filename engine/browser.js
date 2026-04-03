@@ -346,9 +346,13 @@ class BrowserEngine {
       }
 
       // 3. Skip Live Lessons / Office Hours - ONLY if actually in a module
-      if (isActivity && (pageText.includes('Live Lesson') || pageText.includes('Office Hours'))) {
+      const pageTitle = await this.page.title().catch(() => '');
+      const mainHeading = await this.page.locator('h1, h2, h3').first().innerText().catch(() => '');
+      const shouldSkip = (pageTitle.includes('Live Lesson') || pageTitle.includes('Office Hours') || mainHeading.includes('Live Lesson') || mainHeading.includes('Office Hours'));
+
+      if (isActivity && shouldSkip) {
         logger.info('Skipping Live Lesson / Office Hours material.');
-        const nextBtn = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity"), a:has-text("Next activity"), a:has-text("Next Section"), a:has-text("Next section"), button:has-text("Next Session"), a:has-text("Next"), .next-activity-text').first();
+        const nextBtn = await this.page.locator('a.next-activity-link, a[data-region="next-activity-link"], a:has-text("Next Activity")').first();
         if (await nextBtn.isVisible().catch(() => false)) {
           logger.info(`Skipping material: clicking "${await nextBtn.innerText().catch(() => 'Next')}"`);
           await this.safeInteract(nextBtn, 'click');
