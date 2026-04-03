@@ -37,10 +37,10 @@ class BrowserEngine {
         let totalHeight = 0;
         let distance = 100;
         let timer = setInterval(() => {
-          let scrollHeight = document.body.scrollHeight;
+          let scrollHeight = document.body ? document.body.scrollHeight : 0;
           window.scrollBy(0, distance);
           totalHeight += distance;
-          if (totalHeight >= scrollHeight) {
+          if (totalHeight >= scrollHeight || scrollHeight === 0) {
             clearInterval(timer);
             resolve();
           }
@@ -107,7 +107,10 @@ class BrowserEngine {
       }
 
       // Check if we hit the bottom before scrolling again
-      const isAtBottom = await this.page.evaluate(() => (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 50));
+      const isAtBottom = await this.page.evaluate(() => {
+        if (!document.body) return true;
+        return (window.innerHeight + window.scrollY) >= (document.body.scrollHeight - 50);
+      });
       if (isAtBottom) {
         logger.info('Reached bottom of page. Final scan complete.');
         break;
@@ -352,7 +355,9 @@ class BrowserEngine {
         logger.info('Video skipped to end. Waiting for LMS sync...');
         await this.page.waitForTimeout(3000); // 3s buffer for LMS to register completion
       } else if (isPDFVisible) {
-        await this.page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
+        await this.page.evaluate(() => {
+          if (document.body) window.scrollTo(0, document.body.scrollHeight);
+        });
         logger.info('Scrolled through PDF');
       } else if (isQuiz) {
         await this.handleQuiz();
