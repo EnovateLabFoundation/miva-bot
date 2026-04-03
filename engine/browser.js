@@ -234,7 +234,7 @@ class BrowserEngine {
     let finished = false;
     while (!finished) {
       try {
-        await this.page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => {});
+        await this.page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
         const progress = await this.getProgress();
         if (progress >= 70) {
           logger.info(`Goal reached: ${progress}% progress.`);
@@ -250,7 +250,7 @@ class BrowserEngine {
       } catch (error) {
         if (error.message.includes('context was destroyed') || error.message.includes('navigation')) {
           logger.warn('Navigation interrupted the cycle. Retrying after stabilization...');
-          await this.page.waitForLoadState('load', { timeout: 5000 }).catch(() => {});
+          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
         } else {
           throw error;
         }
@@ -284,7 +284,7 @@ class BrowserEngine {
           if (await link.isVisible().catch(() => false)) {
             logger.info(`Entering next task: ${await link.innerText().catch(() => 'Activity')}`);
             await this.safeInteract(link, 'click');
-            await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+            await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
             return;
           }
         }
@@ -295,7 +295,7 @@ class BrowserEngine {
       if (await resumeBtn.isVisible().catch(() => false)) {
         logger.info('Found Resume/Continue button. Clicking...');
         await this.safeInteract(resumeBtn, 'click');
-        await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+        await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
         return;
       }
 
@@ -327,7 +327,7 @@ class BrowserEngine {
 
   async runActivityCycle() {
     try {
-      await this.page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => {});
+      await this.page.waitForLoadState('domcontentloaded', { timeout: 60000 }).catch(() => {});
       
       const url = this.page.url();
       const isActivity = url.includes('/mod/') || url.includes('view.php?id=') === false; 
@@ -402,7 +402,7 @@ class BrowserEngine {
       if (nextBtn) {
         logger.info(`Cycle end: Navigating via found button: "${await nextBtn.innerText().catch(() => 'Next Activity')}"`);
         await this.safeInteract(nextBtn, 'click');
-        await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+        await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
       } else {
         // Fallback for Moodle: Find the text-based link with bold characters which is usually the only visible navigation link on the right.
         const rightNav = await this.page.locator('.activity-navigation a.pull-right, .nav-links a:has(strong, b)').first();
@@ -410,7 +410,7 @@ class BrowserEngine {
           logger.info(`Found potential navigation link: "${await rightNav.innerText()}"`);
           await rightNav.scrollIntoViewIfNeeded();
           await this.safeInteract(rightNav, 'click');
-          await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
         } else {
           logger.info('Standard navigation not found. Consulting LLM for the "Smart" next step...');
           const map = await this.getInteractiveMap();
@@ -443,7 +443,7 @@ class BrowserEngine {
       const attemptBtn = await this.page.locator('button:has-text("Answer the Questions"), button:has-text("Attempt"), button:has-text("Attempt Quiz"), button:has-text("Continue your attempt"), button:has-text("Re-attempt quiz")').first();
       if (await attemptBtn.isVisible()) {
         await this.safeInteract(attemptBtn, 'click');
-        await this.page.waitForLoadState('load', { timeout: 15000 }).catch(() => {});
+        await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
       }
 
       let assessmentFinished = false;
@@ -533,7 +533,7 @@ class BrowserEngine {
 
         if (await nextQ.isVisible()) {
           await nextQ.evaluate(el => el.click());
-          await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+          await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
         } else if (await finishAttempt.isVisible()) {
           logger.info('Finished all questions on page. Proceeding to Summary...');
           await finishAttempt.evaluate(el => el.click());
@@ -603,7 +603,7 @@ class BrowserEngine {
             logger.info(`Executing LLM Click on: "${element.text}" (Index ${index})`);
             const preciseLocator = this.page.locator(`${element.tag.toLowerCase()}:has-text("${element.text}")`).first();
             await this.safeInteract(preciseLocator, 'click');
-            await this.page.waitForLoadState('load', { timeout: 10000 }).catch(() => {});
+            await this.page.waitForLoadState('load', { timeout: 60000 }).catch(() => {});
           }
         }
       } else if (decision.includes('SCROLL_DOWN')) {
