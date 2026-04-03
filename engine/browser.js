@@ -328,7 +328,7 @@ class BrowserEngine {
       
       const url = this.page.url();
       const isActivity = url.includes('/mod/') || url.includes('view.php?id=') === false; 
-      const pageText = await this.page.innerText('body');
+      const pageText = await this.page.innerText('body').catch(() => '');
 
       // 1. Mark Done always
       const markDone = await this.page.locator('button:has-text("Mark Done"), .btn-mark-done').first();
